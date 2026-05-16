@@ -1,6 +1,6 @@
 # Memory Service for AI Agents
 
-A Dockerized memory service that ingests conversation turns, extracts structured knowledge via LLM, and answers recall queries with context-aware retrieval.
+A Dockerized memory service that ingests conversation turns, extracts structured knowledge via LLM + rule-based fallback, and answers recall queries with hybrid vector/BM25 retrieval.
 
 ## Architecture
 
@@ -58,31 +58,41 @@ Total cost per turn: ~$0.0003 (extraction + contradiction + embedding). Total co
 
 ## Extraction Pipeline
 
-Raw conversation turns are processed into structured memories via GPT-4o-mini with `json_schema` response format:
+Raw conversation turns are processed into structured memories via a two-track extraction system (rules + LLM):
 
-1. **Persist turn** to PostgreSQL
-2. **LLM extraction** — structured JSON output with type (`fact|preference|opinion|event`), normalized key (controlled vocabulary: employer, location, pet, dietary_restriction, etc.), atomic value, and confidence score. Extraction prompt rejects passing observations ("flights are expensive") and distinguishes desires ("wants to learn Rust" → preference, not fact).
-3. **Same-turn deduplication** — if the LLM extracts multiple memories with the same key from one message, merge into one memory (preferring `fact` over `opinion`, combining values). Prevents broken supersession chains.
-4. **Contradiction check** — compare ONLY against the most recent existing memory for the same key. LLM classifies the relationship: `new`, `update`, `contradiction`, `correction`, or `nuance`. Prompt explicitly separates sentiment from fact ("loves living in Berlin" ≠ new location).
-5. **Supersession** — for update/contradict/correction/nuance: deactivate old memory, create new with `supersedes` chain. History preserved via linked list.
-6. **Batch embed** — all new memories embedded in one API call (`text-embedding-3-small`, 1536d)
-7. **Cross-key contradiction check** — after embedding, each new fact/preference is compared against ALL active memories with different keys. pgvector similarity search (cosine > 0.80) identifies semantically related memories; LLM classifies the relationship. If `employer="Joined Stripe"` conflicts with `title="Senior PM at Notion"`, the old title gets deactivated. Runs only for `fact` and `preference` types.
+1. **Persist turn** to PostgreSQL — short transaction, committed before any LLM calls
+2. **Rule-based extraction** — always runs, no API key needed. 16 regex patterns covering location, employment, pets, allergies, diet, communication style, preferences, name, and corrections. Subject gate: only extracts from `role=user` messages. Key normalization via alias map (company→employer, city→location, job→occupation). Confidence scoring based on key specificity and value length.
+3. **LLM extraction** — runs in parallel when `OPENAI_API_KEY` is set. Structured JSON output via GPT-4o-mini with type (`fact|preference|opinion|event`), normalized key, atomic value, and confidence score. Rejects passing observations and distinguishes desires from facts.
+4. **Merge** — LLM wins on key conflict (richer values), rules fill gaps when LLM misses or is unavailable.
+5. **Same-turn deduplication** — if multiple memories share the same key from one message, merge into one memory (preferring `fact` over `opinion`). Prevents broken supersession chains.
+6. **Contradiction check** — compare ONLY against the most recent existing memory for the same key. LLM classifies: `new`, `update`, `contradiction`, `correction`, or `nuance`. Separates sentiment from fact.
+7. **Supersession** — for update/contradict/correction/nuance: deactivate old memory, create new with `supersedes` chain.
+8. **Batch embed** — all new memories embedded in one API call (`text-embedding-3-small`, 1536d)
+9. **Cross-key contradiction check** — after embedding, each new fact/preference is compared against ALL active memories with different keys via pgvector similarity (cosine > 0.70). LLM classifies the relationship. Always-cross-check pairs (employer↔title, location↔city) bypass the similarity threshold.
 
-Extraction handles: explicit facts, implicit facts ("walking Biscuit" → has a dog named Biscuit), corrections ("actually, I meant React Native"), mixed fact+sentiment statements ("moved to Berlin, loving it" → one location fact), opinion evolution, and cross-key contradictions where semantically related facts have different key names. Multi-message turns (including tool calls with `name` field) are handled — the extraction pipeline concatenates all messages and processes them as a single conversation segment.
+The turn router uses a two-phase commit: Phase 1 persists the turn and commits immediately; Phase 2 runs extraction and commits separately. If extraction fails, the turn remains in the database — no lost data. No `SELECT FOR UPDATE` locks during extraction, eliminating deadlock risk under concurrent writes.
 
-If the OpenAI API is unavailable, the turn is still persisted and extraction fails gracefully with a warning log.
+All Pydantic schemas use `extra="forbid"` — unknown fields in request bodies are rejected with 422, ensuring strict contract compliance.
 
 ## Recall Strategy
 
-`POST /recall` runs a 7-stage pipeline:
+`POST /recall` runs a 7-stage pipeline (with BM25-only fallback when no API key):
 
-1. **Query rewriting** — LLM decomposes multi-hop queries into 2-3 sub-queries. Simple queries pass through unchanged. Sub-query embeddings batched in one API call.
+1. **Query rewriting** — LLM decomposes multi-hop queries into 2-3 sub-queries. Simple queries pass through unchanged. Sub-query embeddings batched in one API call. (Skipped without API key.)
 2. **Vector search** — pgvector HNSW cosine similarity, top-20 candidates per sub-query
 3. **BM25 search** — pre-computed `tsvector` column with GIN index + `websearch_to_tsquery` (falls back to `plainto_tsquery`), top-20 candidates per sub-query
 4. **Reciprocal Rank Fusion** (k=60) — merge all sub-query result sets, deduplicate by memory ID
-5. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking with multi-hop reasoning. Returns grouped memories that jointly answer the query.
+5. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking with multi-hop reasoning. Returns grouped memories that jointly answer the query. (Skipped without API key.)
 6. **Noise gating** — adaptive similarity thresholds filter irrelevant results: 0.35 floor, 0.50 breakpoint with stricter filtering below, relevance density check for stable facts
 7. **Context assembly** — format ranked memories into structured text under the token budget, with relevance gating and dynamic budget allocation
+
+### BM25-only Fallback (no API key)
+
+When `OPENAI_API_KEY` is not set, recall and search operate without embeddings or LLM calls:
+
+- **`/recall`** uses BM25 keyword search to find relevant memories, assembles context with the same token budget priority (stable facts 35%, query-relevant 50%, recent context 15%). Falls back to recent memories if BM25 returns no matches.
+- **`/search`** uses BM25 keyword search directly, returning scored results. Falls back to recent memories if BM25 returns no matches.
+- Rule-based extraction still runs, so memories are created and stored — just without LLM enrichment.
 
 ### Token Budget Priority
 
@@ -137,15 +147,15 @@ The supersession chain is fully inspectable via `GET /users/{user_id}/memories` 
 
 **Optimized for recall quality, not latency.** Each `/recall` makes 3-4 LLM calls (query rewriting + embedding + reranking + optional cross-key check). This adds ~600ms but significantly improves relevance, especially for multi-hop queries.
 
-**Synchronous extraction in `/turns`.** No Celery, no Redis queue. The 60-second eval timeout is generous. Synchronous means no race conditions — after `/turns` returns, memories are immediately queryable.
+**Two-phase commit in `/turns`.** No Celery, no Redis queue. Phase 1 persists the turn and commits immediately. Phase 2 runs extraction (rules + LLM) and commits separately. After `/turns` returns, the turn is always persisted; memories may be missing if extraction fails but no data is lost. Two separate transactions eliminate deadlock risk from holding `SELECT FOR UPDATE` locks during network I/O.
 
-**Single extraction model.** GPT-4o-mini handles extraction, contradiction, query rewriting, and reranking. No fallback to rule-based extraction. If OpenAI is down, extraction fails but turns persist.
+**Dual-track extraction: rules + LLM.** Rule-based extraction (16 regex patterns, user-only gate, key normalization) always runs and works without any API key. LLM extraction adds richer values and broader coverage. LLM wins on key conflict; rules fill gaps when LLM is unavailable or misses a pattern.
 
 **Query rewriting with cheap gate.** Queries ≤ 4 words skip the rewrite LLM call entirely. Longer queries are decomposed into sub-queries only when the LLM flags `is_multi_hop: true`. Most queries pass through unchanged.
 
 **Embeddings on memories table.** Fewer joins = simpler queries, faster recall. Tradeoff: one embedding per memory (sufficient for atomic facts).
 
-**Search endpoint.** `/search` now includes LLM reranking (top-10 candidates after RRF fusion) and returns `key` and `type` fields alongside the `content` field. BM25 uses `websearch_to_tsquery` with `plainto_tsquery` fallback for better phrase handling. Callers needing the full structured memory graph should use `/users/{user_id}/memories`.
+**Search endpoint.** `/search` includes LLM reranking (top-10 candidates after RRF fusion) when the API key is available, and returns `key` and `type` fields alongside the `content` field. BM25 uses `websearch_to_tsquery` with `plainto_tsquery` fallback for better phrase handling. Without an API key, search uses BM25-only with scored results. Callers needing the full structured memory graph should use `/users/{user_id}/memories`.
 
 ## Failure Modes
 
@@ -153,9 +163,9 @@ The supersession chain is fully inspectable via `GET /users/{user_id}/memories` 
 |----------|----------|
 | No memories for user | `/recall` returns `{"context": "", "citations": []}` — 200 OK |
 | Unrelated query | Stable facts filtered by relevance; empty context if nothing matches |
-| OpenAI API down | `/turns` persists the turn, extraction logged as warning, returns 201 |
-| Missing OPENAI_API_KEY | Service starts, `/turns` works without extraction, `/recall` returns empty context |
-| Malformed JSON | 422 Unprocessable Entity from Pydantic validation |
+| OpenAI API down | `/turns` persists the turn, rule-based extraction still runs, returns 201. LLM extraction logged as warning. |
+| Missing OPENAI_API_KEY | Service starts, `/turns` works with rule-based extraction only, `/recall` uses BM25-only fallback |
+| Malformed JSON | 422 Unprocessable Entity from Pydantic validation (strict `extra="forbid"`) |
 | Unicode content | PostgreSQL handles UTF-8 natively, no special handling needed |
 | Oversized payload | FastAPI default body size limit applies |
 | Delete nonexistent | 204 No Content (idempotent) |
@@ -214,7 +224,7 @@ Set in `.env`:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | For extraction, embeddings, and reranking |
+| `OPENAI_API_KEY` | No | For LLM extraction, embeddings, and reranking. Without it, rule-based extraction and BM25 recall work. |
 | `MEMORY_AUTH_TOKEN` | No | If set, requires Bearer auth on all endpoints |
 | `PORT` | No | Default 8080 |
 | `DATABASE_URL` | No | Default uses the Docker Compose Postgres |
