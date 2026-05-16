@@ -5,7 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repositories.memory_repo import MemoryRepo
 from src.services.llm_service import llm_service
-from src.services.rule_extractor import RuleExtractor
+from src.services.rule_extractor import RuleExtractor, normalize_key
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +38,18 @@ class ExtractionService:
             logger.info("Skipping extraction — no user_id")
             return []
 
-        try:
-            raw_memories = await llm_service.extract_memories(messages)
-        except Exception as e:
-            logger.warning(f"LLM extraction failed: {e}")
-            raw_memories = RuleExtractor().extract(messages)
-            if not raw_memories:
-                return []
+        # Rules always run
+        rule_memories = RuleExtractor().extract(messages)
+
+        # LLM only if key is available
+        llm_memories = []
+        if settings.llm_available:
+            try:
+                llm_memories = await llm_service.extract_memories(messages)
+            except Exception as e:
+                logger.warning(f"LLM extraction failed: {e}")
+
+        raw_memories = self._merge_extractions(rule_memories, llm_memories)
 
         if not raw_memories:
             logger.info("No memories extracted")
@@ -71,8 +77,6 @@ class ExtractionService:
         if to_embed:
             await self._batch_embed(to_embed)
 
-        # Cross-key contradiction check — runs after embedding so pgvector
-        # similarity search works on the newly stored memories.
         re_embed_needed = await self._cross_key_contradiction_check(
             user_id, stored,
         )
@@ -85,13 +89,23 @@ class ExtractionService:
             for m in stored
         ]
 
-    def _dedup_same_turn(self, raw_memories: list[dict]) -> list[dict]:
-        """Merge same-key extractions from a single LLM call.
+    def _merge_extractions(self, rules: list[dict], llm: list[dict]) -> list[dict]:
+        """LLM wins on key conflict (richer values), rules fill gaps."""
+        merged = {}
 
-        When the LLM extracts multiple memories with the same key from one
-        message (e.g. a location fact + a location opinion), we merge them
-        into one memory preferring fact over opinion, combining values.
-        """
+        for r in rules:
+            key = normalize_key(r["key"])
+            merged[key] = {**r, "key": key}
+
+        for r in llm:
+            key = normalize_key(r.get("key", ""))
+            if not key:
+                continue
+            merged[key] = {**r, "key": key}
+
+        return list(merged.values())
+
+    def _dedup_same_turn(self, raw_memories: list[dict]) -> list[dict]:
         grouped = defaultdict(list)
         for mem in raw_memories:
             grouped[mem["key"]].append(mem)
@@ -125,7 +139,7 @@ class ExtractionService:
         value: str,
         confidence: float,
     ) -> object | None:
-        existing = await self.memory_repo.get_active_by_key(user_id, key, for_update=True)
+        existing = await self.memory_repo.get_active_by_key(user_id, key, for_update=False)
 
         if not existing:
             memory = await self.memory_repo.create(
@@ -140,7 +154,6 @@ class ExtractionService:
             logger.info(f"New memory: {key}={value[:80]}")
             return memory
 
-        # Compare only with the most recent memory for this key
         old_mem = existing[0]
         best_relationship = "new"
         best_match = old_mem
@@ -184,7 +197,6 @@ class ExtractionService:
             logger.info(f"Nuance added for {key}: {value[:80]} (old kept active)")
             return memory
 
-        # update, contradiction, correction → deactivate only matched memory, supersede
         await self.memory_repo.deactivate_by_id(best_match.id)
         memory = await self.memory_repo.create(
             user_id=user_id,
@@ -205,13 +217,6 @@ class ExtractionService:
     async def _cross_key_contradiction_check(
         self, user_id: str, new_memories: list,
     ) -> list:
-        """Find and resolve contradictions between memories with different keys.
-
-        Uses pgvector similarity search instead of Python cosine, which is
-        both faster and avoids loading all active memories into memory.
-
-        Returns a list of memories that need re-embedding (value was mutated).
-        """
         if not new_memories:
             return []
 
@@ -234,11 +239,10 @@ class ExtractionService:
                 limit=5,
             )
 
-            # Augment with always-cross-check pairs not already in similar results
             similar_keys = {old_mem.key for old_mem, _ in similar}
             for pair in ALWAYS_CROSS_CHECK_PAIRS:
                 if new_mem.key in pair:
-                    paired_key = (pair - {new_mem.key}).pop()
+                    paired_key = next(iter(pair - {new_mem.key}))
                     if paired_key not in similar_keys:
                         paired_memories = await self.memory_repo.get_active_by_key(
                             user_id, paired_key

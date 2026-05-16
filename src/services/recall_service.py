@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config import settings
 from src.repositories.memory_repo import MemoryRepo
 from src.repositories.turn_repo import TurnRepo
 from src.services.llm_service import llm_service
@@ -188,6 +189,10 @@ class RecallService:
         if not user_id:
             return await self._session_recall(query, session_id, max_tokens)
 
+        # No LLM key — BM25-only recall
+        if not settings.llm_available:
+            return await self._bm25_fallback_recall(query, user_id, max_tokens)
+
         # Query rewriting: decompose multi-hop queries into sub-queries
         sub_queries = await self._rewrite_query(query)
 
@@ -195,8 +200,8 @@ class RecallService:
         try:
             all_embeddings = await llm_service.embed(sub_queries)
         except Exception as e:
-            logger.warning(f"Query embedding failed, falling back to recent: {e}")
-            return await self._fallback_recall(user_id, max_tokens)
+            logger.warning(f"Query embedding failed, falling back to BM25: {e}")
+            return await self._bm25_fallback_recall(query, user_id, max_tokens)
 
         # Run hybrid search for each sub-query and merge results
         all_vector_results: list[tuple] = []
@@ -213,7 +218,7 @@ class RecallService:
 
         fused = rrf_merge(all_vector_results, all_bm25_results)
         if not fused:
-            return await self._fallback_recall(user_id, max_tokens)
+            return await self._bm25_fallback_recall(query, user_id, max_tokens)
 
         reranked = await self._rerank(query, fused, sub_queries)
 
@@ -398,6 +403,53 @@ class RecallService:
         context = "\n\n".join(s for s in sections if s)
 
         # Hard cap: ensure we don't exceed max_tokens by more than 20%
+        max_chars = int(max_tokens * 3 * 1.2)
+        if len(context) > max_chars:
+            context = context[:max_chars] + "..."
+
+        return context, citations
+
+    async def _bm25_fallback_recall(
+        self, query: str, user_id: str, max_tokens: int
+    ) -> tuple[str, list[dict]]:
+        """BM25-based recall when embeddings/LLM are unavailable."""
+        bm25_results = await self.memory_repo.bm25_search(user_id, query, limit=20)
+
+        if not bm25_results:
+            return await self._fallback_recall(user_id, max_tokens)
+
+        fused = rrf_merge([], bm25_results)
+
+        budget = max_tokens
+        sections = []
+        citations = []
+
+        # Stable facts (no embedding filter needed)
+        stable_facts = await self.memory_repo.get_stable_facts(user_id)
+        facts_budget = int(budget * 0.35)
+        facts_text = format_stable_facts(stable_facts, facts_budget)
+        if facts_text:
+            sections.append(facts_text)
+        used = estimate_tokens(facts_text)
+
+        # Query-relevant (BM25 ranked)
+        relevant_budget = min(int(budget * 0.50), budget - used)
+        relevant_text, relevant_citations = format_relevant_memories(fused, relevant_budget)
+        if relevant_text:
+            sections.append(relevant_text)
+            citations.extend(relevant_citations)
+        used += estimate_tokens(relevant_text)
+
+        # Recent context
+        remaining = budget - used - 50
+        if remaining > 100:
+            recent_turns = await self.turn_repo.get_recent_by_user(user_id, limit=3)
+            recent_text = format_recent_turns(recent_turns, remaining)
+            if recent_text:
+                sections.append(recent_text)
+
+        context = "\n\n".join(s for s in sections if s)
+
         max_chars = int(max_tokens * 3 * 1.2)
         if len(context) > max_chars:
             context = context[:max_chars] + "..."

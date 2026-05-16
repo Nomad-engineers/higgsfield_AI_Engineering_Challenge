@@ -3,56 +3,166 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+KEY_ALIASES = {
+    "company": "employer",
+    "workplace": "employer",
+    "city": "location",
+    "hometown": "location",
+    "job": "occupation",
+    "role": "occupation",
+    "position": "occupation",
+    "title": "occupation",
+    "diet": "dietary_restriction",
+    "food_preference": "dietary_restriction",
+}
+
+
+def normalize_key(key: str) -> str:
+    return KEY_ALIASES.get(key, key)
+
+
 PATTERNS = [
+    # --- Location ---
     (
         re.compile(
-            r"I\s+(?:live|lived|moved\s+to)\s+(?:in|at|from)\s+(.+?)(?:\.|!|$)",
-            re.IGNORECASE,
+            r"(?i)\bI\s+(?:live|am living|am based|reside|moved)\s+(?:in|to)\s+(.+?)(?:\.|,|!|$)"
         ),
         "location",
         "fact",
     ),
     (
         re.compile(
-            r"I\s+(?:work|worked|joined)\s+(?:at|for)\s+(.+?)(?:\.|!|$)",
-            re.IGNORECASE,
+            r"(?i)\bI(?:'m| am)\s+from\s+(.+?)(?:\.|,|!|$)"
+        ),
+        "location",
+        "fact",
+    ),
+    # --- Employment ---
+    (
+        re.compile(
+            r"(?i)\bI\s+(?:work|am working|am employed)\s+(?:at|for|with)\s+(.+?)(?:\.|,|!|$)"
         ),
         "employer",
         "fact",
     ),
     (
         re.compile(
-            r"I(?:'m| am)\s+(?:allergic\s+to|have\s+an?\s+allergy\s+to)\s+(.+?)(?:\.|!|$)",
-            re.IGNORECASE,
+            r"(?i)\bI\s+(?:just\s+)?(?:joined|started|hired|got a job)\s+(?:at\s+)?(.+?)(?:\.|,|!|$)"
         ),
-        "allergy",
+        "employer",
         "fact",
     ),
     (
         re.compile(
-            r"my\s+(dog|cat|pet)\s+(?:named|called)\s+(.+?)(?:\.|!|$)",
-            re.IGNORECASE,
+            r"(?i)\bmy\s+(?:job|role|position|title)\s+(?:is|was)\s+(.+?)(?:\.|,|!|$)"
+        ),
+        "occupation",
+        "fact",
+    ),
+    # --- Pets ---
+    (
+        re.compile(
+            r"(?i)\bI\s+(?:have|got|own)\s+a\s+(\w+)\s+(?:named|called)\s+(\w+)"
         ),
         "pet",
         "fact",
     ),
     (
         re.compile(
-            r"I(?:'m| am)\s+(?:a|an)\s+(.+?)(?:\.|!|$)",
-            re.IGNORECASE,
+            r"(?i)\bmy\s+(\w+)\s+(?:named|called)\s+(\w+)"
         ),
-        "occupation",
+        "pet",
         "fact",
     ),
     (
         re.compile(
-            r"my\s+(?:name\s+(?:is|'s))\s+(.+?)(?:\.|!|$)",
-            re.IGNORECASE,
+            r"(?i)\b(?:walking|feeding|playing\s+with)\s+(?:my\s+)?(\w+)\s+(?:named\s+)?(\w+)"
+        ),
+        "pet",
+        "fact",
+    ),
+    # --- Allergies ---
+    (
+        re.compile(
+            r"(?i)\bI(?:'m| am)\s+(?:allergic|intolerant)\s+to\s+(.+?)(?:\.|,|!|$)"
+        ),
+        "allergy",
+        "fact",
+    ),
+    # --- Diet ---
+    (
+        re.compile(
+            r"(?i)\bI(?:'m| am)\s+(vegetarian|vegan|pescatarian|keto|paleo|gluten[\s-]free)\b"
+        ),
+        "dietary_restriction",
+        "fact",
+    ),
+    (
+        re.compile(
+            r"(?i)\bI\s+(?:don't|do not)\s+eat\s+(.+?)(?:\.|,|!|$)"
+        ),
+        "dietary_restriction",
+        "fact",
+    ),
+    # --- Communication style ---
+    (
+        re.compile(
+            r"(?i)\bI\s+(?:prefer|like|want)\s+(?:my\s+)?(?:answers?|responses?|replies?)\s+(?:to be\s+)?(.+?)(?:\.|,|!|$)"
+        ),
+        "communication_style",
+        "preference",
+    ),
+    (
+        re.compile(
+            r"(?i)\bplease\s+be\s+(concise|detailed|brief|short|direct|formal|casual)"
+        ),
+        "communication_style",
+        "preference",
+    ),
+    # --- Preferences (opinions) ---
+    (
+        re.compile(
+            r"(?i)\bI\s+(?:love|hate|really\s+(?:like|dislike))\s+(.+?)(?:\.|,|!|$)"
+        ),
+        "preference",
+        "preference",
+    ),
+    # --- Name ---
+    (
+        re.compile(
+            r"(?i)\bmy\s+name\s+(?:is|'s)\s+(.+?)(?:\.|,|!|$)"
         ),
         "name",
         "fact",
     ),
+    # --- Correction ---
+    (
+        re.compile(
+            r"(?i)\b(?:actually|sorry|i meant)\s*[,:]?\s*(?:not\s+)?(.+?)(?:\.|,|!|$)"
+        ),
+        "correction",
+        "fact",
+    ),
+    # --- Fallback occupation ---
+    (
+        re.compile(
+            r"(?i)\bI(?:'m| am)\s+(?:a|an)\s+(.+?)(?:\.|,|!|$)"
+        ),
+        "occupation",
+        "fact",
+    ),
 ]
+
+HIGH_CONFIDENCE_KEYS = {"employer", "location", "name", "allergy"}
+
+
+def _confidence_for_match(key: str, value: str) -> float:
+    base = 0.7
+    if len(value) > 20:
+        base += 0.05
+    if key in HIGH_CONFIDENCE_KEYS:
+        base += 0.1
+    return min(base, 0.85)
 
 
 class RuleExtractor:
@@ -61,33 +171,38 @@ class RuleExtractor:
         seen = set()
 
         for msg in messages:
+            if msg.get("role") != "user":
+                continue
+
             content = msg.get("content", "")
             if not content or not isinstance(content, str):
                 continue
 
             for pattern, key, type_ in PATTERNS:
                 for match in pattern.finditer(content):
-                    value = match.group(1).strip()
-                    dedup_key = (key, value.lower())
+                    groups = [g for g in match.groups() if g]
+                    if not groups:
+                        continue
+
+                    if key == "pet" and len(groups) >= 2:
+                        pet_type = groups[0].lower()
+                        pet_name = groups[1].strip()
+                        value = f"Has a {pet_type} named {pet_name}"
+                        dedup_key = (key, pet_name.lower())
+                    else:
+                        value = groups[0].strip()
+                        dedup_key = (key, value.lower())
+
                     if dedup_key in seen:
                         continue
                     seen.add(dedup_key)
 
-                    if key == "pet":
-                        pet_type = match.group(1).lower()
-                        results.append({
-                            "type": type_,
-                            "key": key,
-                            "value": f"Has a {pet_type} named {value}",
-                            "confidence": 0.7,
-                        })
-                    else:
-                        results.append({
-                            "type": type_,
-                            "key": key,
-                            "value": value,
-                            "confidence": 0.7,
-                        })
+                    results.append({
+                        "type": type_,
+                        "key": key,
+                        "value": value,
+                        "confidence": _confidence_for_match(key, value),
+                    })
 
         if results:
             logger.info(f"Rule-based extraction found {len(results)} memories")

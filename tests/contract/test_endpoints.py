@@ -130,6 +130,35 @@ class TestMemories:
         assert body["memories"] == []
 
 
+class TestExtraFieldsRejected:
+    def test_turns_rejects_unknown_fields(self, client):
+        resp = client.post("/turns", json={
+            "session_id": "ctest-extra",
+            "messages": [{"role": "user", "content": "hi"}],
+            "timestamp": "2025-01-01T00:00:00Z",
+            "metadata": {},
+            "unknown_field": "should_fail",
+        })
+        assert resp.status_code == 422
+
+    def test_recall_rejects_unknown_fields(self, client):
+        resp = client.post("/recall", json={
+            "query": "test",
+            "session_id": "ctest-extra",
+            "max_tokens": 512,
+            "extra": "bad",
+        })
+        assert resp.status_code == 422
+
+    def test_search_rejects_unknown_fields(self, client):
+        resp = client.post("/search", json={
+            "query": "test",
+            "session_id": "ctest-extra",
+            "bogus": True,
+        })
+        assert resp.status_code == 422
+
+
 class TestCleanup:
     def test_delete_session_returns_204(self, client):
         resp = client.delete("/sessions/ctest-session")

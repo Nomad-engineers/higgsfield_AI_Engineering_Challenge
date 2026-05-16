@@ -16,21 +16,16 @@ class MemoryService:
         self.session = session
         self.extraction = ExtractionService(session)
 
-    async def store_turn(self, session_id, user_id, messages, timestamp, metadata=None):
-        turn = await self.turn_repo.create(session_id, user_id, messages, timestamp, metadata)
+    async def persist_turn(self, session_id, user_id, messages, timestamp, metadata=None):
+        return await self.turn_repo.create(session_id, user_id, messages, timestamp, metadata)
 
-        if user_id:
-            try:
-                await self.extraction.extract_and_store(
-                    messages=messages,
-                    user_id=user_id,
-                    session_id=session_id,
-                    turn_id=turn.id,
-                )
-            except Exception as e:
-                logger.warning(f"Extraction pipeline failed for turn {turn.id}: {e}")
-
-        return turn
+    async def extract_and_persist_memories(self, messages, user_id, session_id, turn_id=None):
+        await self.extraction.extract_and_store(
+            messages=messages,
+            user_id=user_id,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
 
     async def get_user_memories(self, user_id: str):
         return await self.memory_repo.get_active_by_user(user_id)

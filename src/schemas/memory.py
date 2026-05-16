@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class MemoryOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     id: str
     type: str
     key: str
@@ -19,4 +20,5 @@ class MemoryOut(BaseModel):
 
 
 class MemoryListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     memories: list[MemoryOut]
