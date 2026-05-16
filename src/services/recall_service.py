@@ -23,6 +23,27 @@ STABLE_FACTS_MIN_DENSITY = 0.15
 KEY_MATCH_BOOST = 2.0
 SESSION_BOOST_ALPHA = 0.05
 
+KEY_RELATIONS = {
+    "pet": {"location", "name", "spouse", "child"},
+    "employer": {"occupation", "title", "location", "education"},
+    "spouse": {"spouse_occupation", "location", "child"},
+    "child": {"location", "name", "spouse"},
+    "location": {"employer", "pet", "name", "hobby"},
+    "programming_language": {"framework", "employer"},
+    "framework": {"programming_language", "employer"},
+    "dietary_restriction": {"allergy"},
+    "allergy": {"dietary_restriction"},
+    "education": {"employer", "occupation"},
+    "name": {"location", "employer"},
+    "occupation": {"employer", "location"},
+    "hobby": {"location", "occupation"},
+    "vehicle": {"location", "employer"},
+    "travel": {"location", "employer"},
+    "mobile_framework": {"programming_language", "employer"},
+    "sport": {"location", "hobby"},
+    "music": {"hobby", "location"},
+}
+
 
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 3)
@@ -238,6 +259,15 @@ class RecallService:
                 user_id, list(hints["hint_keys"]), limit=10
             )
 
+        # Entity expansion for multi-hop queries: follow key relationships
+        if len(sub_queries) > 1:
+            expansion = await self._entity_expansion(
+                user_id, all_vector_results, all_bm25_results, key_results
+            )
+            if expansion:
+                key_results = key_results + expansion
+                logger.info(f"Entity expansion added {len(expansion)} memories for multi-hop")
+
         fused = rrf_merge(all_vector_results, all_bm25_results, key_results, session_id=session_id)
         if not fused:
             logger.info(f"Recall: no fused results (vec={len(all_vector_results)} bm25={len(all_bm25_results)} key={len(key_results)}), query='{query[:50]}'")
@@ -293,6 +323,32 @@ class RecallService:
             bm25_results = []
 
         return vector_results, bm25_results
+
+    async def _entity_expansion(
+        self, user_id: str,
+        vector_results: list[tuple], bm25_results: list[tuple],
+        key_results: list[tuple],
+    ) -> list[tuple]:
+        found_keys = set()
+        for results in [vector_results, bm25_results, key_results]:
+            for memory, _score in results:
+                found_keys.add(memory.key)
+
+        if not found_keys:
+            return []
+
+        related_keys = set()
+        for key in found_keys:
+            if key in KEY_RELATIONS:
+                related_keys.update(KEY_RELATIONS[key])
+
+        related_keys -= found_keys
+
+        if not related_keys:
+            return []
+
+        logger.info(f"Entity expansion: {found_keys} -> {related_keys}")
+        return await self.memory_repo.key_search(user_id, list(related_keys), limit=10)
 
     async def _rerank(
         self, query: str, fused: list[tuple], sub_queries: list[str] | None = None
