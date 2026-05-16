@@ -82,12 +82,15 @@ class MemoryRepo:
         await self.session.flush()
         return result.rowcount
 
-    async def get_active_by_key(self, user_id: str, key: str) -> list[Memory]:
-        result = await self.session.execute(
+    async def get_active_by_key(self, user_id: str, key: str, for_update: bool = False) -> list[Memory]:
+        stmt = (
             select(Memory)
             .where(Memory.user_id == user_id, Memory.key == key, Memory.active == True)
             .order_by(Memory.created_at.desc())
         )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
     async def get_recent_by_user(self, user_id: str, limit: int = 10) -> list[Memory]:
@@ -147,6 +150,7 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
+                embedding=None,
             )
             memories.append((m, float(row.similarity)))
         return memories
@@ -183,6 +187,7 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
+                embedding=None,
             )
             memories.append((m, float(row.bm25_score)))
         return memories
@@ -229,6 +234,7 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
+                embedding=None,
             )
             memories.append((m, float(row.similarity)))
         return memories
@@ -278,6 +284,7 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
+                embedding=None,
             )
             memories.append(m)
         return memories

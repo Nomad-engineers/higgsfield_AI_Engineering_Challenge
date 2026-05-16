@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pydantic import BaseModel
 
 
@@ -9,6 +11,7 @@ class MemoryOut(BaseModel):
     confidence: float
     active: bool
     source_session: str
+    source_turn: str | None = None
     supersedes: str | None = None
     superseded_by: str | None = None
     created_at: str

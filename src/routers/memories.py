@@ -27,6 +27,7 @@ async def get_user_memories(user_id: str, db: AsyncSession = Depends(get_db)):
             confidence=m.confidence,
             active=m.active,
             source_session=m.source_session,
+            source_turn=str(m.source_turn_id) if m.source_turn_id else None,
             supersedes=str(m.supersedes) if m.supersedes else None,
             superseded_by=superseded_by_map.get(str(m.id)),
             created_at=m.created_at.isoformat() if m.created_at else "",

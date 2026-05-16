@@ -129,17 +129,23 @@ class LLMService:
         parsed = json.loads(content)
 
         indices = parsed.get("ranked_indices", [])
-        if indices and min(indices) == 0:
-            parsed["ranked_indices"] = indices
-        else:
-            parsed["ranked_indices"] = [idx - 1 for idx in indices]
+        if indices:
+            valid = [idx for idx in indices if 0 <= idx < len(memories)]
+            oob = [idx for idx in indices if idx < 0 or idx >= len(memories)]
+            if valid and len(valid) >= len(oob):
+                parsed["ranked_indices"] = indices
+            else:
+                parsed["ranked_indices"] = [idx - 1 for idx in indices]
 
         for g in parsed.get("groups", []):
             g_indices = g.get("indices", [])
-            if g_indices and min(g_indices) == 0:
-                g["indices"] = g_indices
-            else:
-                g["indices"] = [idx - 1 for idx in g_indices]
+            if g_indices:
+                valid = [idx for idx in g_indices if 0 <= idx < len(memories)]
+                oob = [idx for idx in g_indices if idx < 0 or idx >= len(memories)]
+                if valid and len(valid) >= len(oob):
+                    g["indices"] = g_indices
+                else:
+                    g["indices"] = [idx - 1 for idx in g_indices]
 
         return parsed
 

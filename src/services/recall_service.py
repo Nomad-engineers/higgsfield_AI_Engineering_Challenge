@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime, timezone
 import uuid
 from collections import defaultdict
 
@@ -12,6 +13,7 @@ from src.services.llm_service import llm_service
 logger = logging.getLogger(__name__)
 
 RRF_K = 60
+TEMPORAL_ALPHA = 0.1
 RERANK_TOP_K = 15
 RECALL_RELEVANCE_THRESHOLD = 0.35
 RERANK_NOISE_FLOOR = 0.35
@@ -27,6 +29,7 @@ def rrf_merge(
 ) -> list[tuple]:
     scores: dict[uuid.UUID, float] = {}
     memories: dict[uuid.UUID, object] = {}
+    now = datetime.now(timezone.utc)
 
     for rank, (memory, _score) in enumerate(vector_results):
         scores[memory.id] = scores.get(memory.id, 0) + 1.0 / (k + rank + 1)
@@ -37,7 +40,14 @@ def rrf_merge(
         memories[memory.id] = memory
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [(memories[mid], score) for mid, score in ranked]
+    result = []
+    for mid, score in ranked:
+        mem = memories[mid]
+        days_old = (now - mem.created_at).days if mem.created_at else 0
+        recency = 1.0 / (1.0 + days_old)
+        adjusted = score * (1 + TEMPORAL_ALPHA * recency)
+        result.append((mem, adjusted))
+    return result
 
 
 def _group_by_key(memories: list) -> dict[str, list]:
@@ -56,17 +66,21 @@ def format_stable_facts(memories: list, budget_tokens: int) -> str:
     grouped = _group_by_key(memories)
     lines = []
     used = 0
-    budget_chars = budget_tokens * 4
+    budget_chars = budget_tokens * 3
+    compact = budget_tokens < 256
 
     for key, mems in grouped.items():
         if len(mems) == 1:
             m = mems[0]
-            line = f"- **{m.key}**: {m.value}"
+            line = f"{m.key}: {m.value}" if compact else f"- **{m.key}**: {m.value}"
         else:
             newest = mems[0]
             older = mems[1:]
             evolution = "; ".join(o.value for o in reversed(older))
-            line = f"- **{newest.key}**: {newest.value} (evolved from: {evolution})"
+            if compact:
+                line = f"{newest.key}: {newest.value} (from {evolution})"
+            else:
+                line = f"- **{newest.key}**: {newest.value} (evolved from: {evolution})"
 
         if used + len(line) + 1 > budget_chars:
             break
@@ -75,6 +89,8 @@ def format_stable_facts(memories: list, budget_tokens: int) -> str:
 
     if not lines:
         return ""
+    if compact:
+        return "\n".join(lines)
     return "## User Profile\n" + "\n".join(lines)
 
 
@@ -87,8 +103,9 @@ def format_relevant_memories(
     lines = []
     citations = []
     used = 0
-    budget_chars = budget_tokens * 4
+    budget_chars = budget_tokens * 3
     seen_keys: dict[str, list] = defaultdict(list)
+    compact = budget_tokens < 256
 
     for memory, score in memories:
         seen_keys[memory.key].append((memory, score))
@@ -96,7 +113,10 @@ def format_relevant_memories(
     for key, items in seen_keys.items():
         if len(items) == 1:
             memory, score = items[0]
-            line = f"- [{memory.type}/{memory.key}] {memory.value}"
+            if compact:
+                line = f"[{memory.type}/{memory.key}] {memory.value}"
+            else:
+                line = f"- [{memory.type}/{memory.key}] {memory.value}"
             if used + len(line) + 1 > budget_chars:
                 break
             lines.append(line)
@@ -110,7 +130,10 @@ def format_relevant_memories(
             newest_mem, newest_score = items[0]
             older_values = [m.value for m, _ in reversed(items[1:])]
             evolution = " → ".join(older_values + [newest_mem.value])
-            line = f"- [{newest_mem.type}/{key}] {evolution}"
+            if compact:
+                line = f"[{newest_mem.type}/{key}] {evolution}"
+            else:
+                line = f"- [{newest_mem.type}/{key}] {evolution}"
             if used + len(line) + 1 > budget_chars:
                 break
             lines.append(line)
@@ -124,13 +147,15 @@ def format_relevant_memories(
 
     if not lines:
         return "", []
+    if compact:
+        return "\n".join(lines), citations
     return "## Query-Relevant Context\n" + "\n".join(lines), citations
 
 
 def format_recent_turns(turns: list, budget_tokens: int) -> str:
     lines = []
     used = 0
-    budget_chars = budget_tokens * 4
+    budget_chars = budget_tokens * 3
 
     for turn in reversed(turns):
         for msg in turn.messages:
@@ -200,9 +225,6 @@ class RecallService:
         )
 
     async def _rewrite_query(self, query: str) -> list[str]:
-        if len(query.split()) <= 4:
-            return [query]
-
         try:
             result = await llm_service.rewrite_query(query)
         except Exception as e:
@@ -224,8 +246,8 @@ class RecallService:
     async def _hybrid_search(
         self, user_id: str, query: str, query_embedding: list[float]
     ) -> tuple[list, list]:
-        vector_coro = self.memory_repo.vector_search(user_id, query_embedding, limit=20)
-        bm25_coro = self.memory_repo.bm25_search(user_id, query, limit=20)
+        vector_coro = self.memory_repo.vector_search(user_id, query_embedding, limit=30)
+        bm25_coro = self.memory_repo.bm25_search(user_id, query, limit=30)
 
         vector_results, bm25_results = await asyncio.gather(
             vector_coro, bm25_coro, return_exceptions=True
@@ -374,6 +396,12 @@ class RecallService:
                 sections.append(recent_text)
 
         context = "\n\n".join(s for s in sections if s)
+
+        # Hard cap: ensure we don't exceed max_tokens by more than 20%
+        max_chars = int(max_tokens * 3 * 1.2)
+        if len(context) > max_chars:
+            context = context[:max_chars] + "..."
+
         return context, citations
 
     async def _fallback_recall(
@@ -395,7 +423,7 @@ class RecallService:
             })
 
         context = "## Recent Memories\n" + "\n".join(lines)
-        max_chars = max_tokens * 4
+        max_chars = max_tokens * 3
         if len(context) > max_chars:
             context = context[:max_chars]
         return context, citations
@@ -414,7 +442,7 @@ class RecallService:
             active = [m for m in memories if m.active]
             if active:
                 lines = []
-                budget_chars = max_tokens * 4
+                budget_chars = max_tokens * 3
                 for m in active:
                     line = f"- [{m.type}/{m.key}] {m.value}"
                     if used + len(line) + 1 > budget_chars:

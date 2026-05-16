@@ -47,6 +47,15 @@ should use type "preference", NOT "fact". They reflect wants, not current state.
 15. For job/school transitions ("joined Stripe, leaving Notion"), extract ONLY the \
 NEW employer/school. Do NOT include "leaving X" or the former employer name — \
 the contradiction pipeline tracks the relationship to old values.
+16. Tool/function call results (role "tool") may contain implicit user facts. \
+Extract relevant facts from tool outputs — e.g., calendar events, contacts, reminders.
+17. Extract named entities with context: "my husband Carlos" → extract both the \
+relationship (spouse) and the name together in one memory.
+18. These are NOT facts about the user — do NOT extract:
+   - "Let's talk about X" → conversational redirect, not a fact
+   - "I was reading about Y" → reading about something ≠ user attribute
+   - "Tell me about Z" or "What is Z?" → a question, not a fact
+   - "my friend said ..." → about the friend, not the user
 
 Examples:
 - "I just moved to Berlin from NYC last month" →
@@ -69,6 +78,17 @@ is folded into the location fact.
   NOTE: Do NOT include "Leaving Notion" — only the current employer.
 - "I'm allergic to shellfish" →
   { type: "fact", key: "allergy", value: "Allergic to shellfish", confidence: 0.95 }
+- "Can't eat shrimp" →
+  { type: "fact", key: "allergy", value: "Allergic to shrimp (likely shellfish allergy)", confidence: 0.85 }
+- "Need to pick up the kids from school at 3" →
+  { type: "fact", key: "family", value: "Has children who attend school", confidence: 0.8 }
+- "my husband Carlos is a doctor" →
+  { type: "fact", key: "spouse", value: "Husband named Carlos", confidence: 0.9 }
+  { type: "fact", key: "spouse_occupation", value: "Husband Carlos is a doctor", confidence: 0.9 }
+- "Let's talk about machine learning" →
+  [] (conversational redirect, not a fact)
+- "I was reading about Rust" →
+  [] (reading about something ≠ it is an attribute of the user)
 - "we went to Japan last summer" →
   { type: "event", key: "travel", value: "Traveled to Japan last summer", confidence: 0.9 }
 - "flights are so expensive these days" →

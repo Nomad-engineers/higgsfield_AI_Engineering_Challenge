@@ -61,9 +61,7 @@ class SearchService:
                 "score": round(score, 4),
                 "session_id": memory.source_session,
                 "timestamp": memory.created_at.isoformat() if memory.created_at else "",
-                "metadata": {},
-                "key": memory.key,
-                "type": memory.type,
+                "metadata": {"key": memory.key, "type": memory.type},
             })
 
         return results
@@ -110,9 +108,7 @@ class SearchService:
                 "score": m.confidence,
                 "session_id": m.source_session,
                 "timestamp": m.created_at.isoformat() if m.created_at else "",
-                "metadata": {},
-                "key": m.key,
-                "type": m.type,
+                "metadata": {"key": m.key, "type": m.type},
             })
         return results
 
@@ -125,8 +121,6 @@ class SearchService:
                 "score": m.confidence,
                 "session_id": m.source_session,
                 "timestamp": m.created_at.isoformat() if m.created_at else "",
-                "metadata": {},
-                "key": m.key,
-                "type": m.type,
+                "metadata": {"key": m.key, "type": m.type},
             })
         return results

@@ -15,6 +15,8 @@ async def lifespan(app: FastAPI):
     logger.info("Memory service started")
     yield
     logger.info("Memory service shutting down")
+    from src.services.llm_service import llm_service
+    await llm_service.close()
 
 
 async def _init_schema():

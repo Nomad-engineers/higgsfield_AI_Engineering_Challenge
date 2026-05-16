@@ -5,13 +5,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repositories.memory_repo import MemoryRepo
 from src.services.llm_service import llm_service
+from src.services.rule_extractor import RuleExtractor
 
 logger = logging.getLogger(__name__)
 
 TYPE_PRIORITY = {"fact": 0, "preference": 1, "event": 2, "opinion": 3}
 
-CROSS_KEY_SIMILARITY_THRESHOLD = 0.80
+CROSS_KEY_SIMILARITY_THRESHOLD = 0.70
 CROSS_KEY_CHECK_TYPES = {"fact", "preference"}
+
+ALWAYS_CROSS_CHECK_PAIRS = {
+    frozenset({"employer", "title"}),
+    frozenset({"employer", "occupation"}),
+    frozenset({"location", "city"}),
+    frozenset({"spouse", "spouse_occupation"}),
+}
 
 
 class ExtractionService:
@@ -33,7 +41,9 @@ class ExtractionService:
             raw_memories = await llm_service.extract_memories(messages)
         except Exception as e:
             logger.warning(f"LLM extraction failed: {e}")
-            return []
+            raw_memories = RuleExtractor().extract(messages)
+            if not raw_memories:
+                return []
 
         if not raw_memories:
             logger.info("No memories extracted")
@@ -115,7 +125,7 @@ class ExtractionService:
         value: str,
         confidence: float,
     ) -> object | None:
-        existing = await self.memory_repo.get_active_by_key(user_id, key)
+        existing = await self.memory_repo.get_active_by_key(user_id, key, for_update=True)
 
         if not existing:
             memory = await self.memory_repo.create(
@@ -161,7 +171,6 @@ class ExtractionService:
             return memory
 
         if best_relationship == "nuance":
-            await self.memory_repo.deactivate_by_id(best_match.id)
             memory = await self.memory_repo.create(
                 user_id=user_id,
                 type=type_,
@@ -172,7 +181,7 @@ class ExtractionService:
                 source_turn_id=turn_id,
                 supersedes=best_match.id,
             )
-            logger.info(f"Nuance added for {key}: {value[:80]}")
+            logger.info(f"Nuance added for {key}: {value[:80]} (old kept active)")
             return memory
 
         # update, contradiction, correction → deactivate only matched memory, supersede
@@ -224,6 +233,18 @@ class ExtractionService:
                 threshold=CROSS_KEY_SIMILARITY_THRESHOLD,
                 limit=5,
             )
+
+            # Augment with always-cross-check pairs not already in similar results
+            similar_keys = {old_mem.key for old_mem, _ in similar}
+            for pair in ALWAYS_CROSS_CHECK_PAIRS:
+                if new_mem.key in pair:
+                    paired_key = (pair - {new_mem.key}).pop()
+                    if paired_key not in similar_keys:
+                        paired_memories = await self.memory_repo.get_active_by_key(
+                            user_id, paired_key
+                        )
+                        for pm in paired_memories:
+                            similar.append((pm, 0.0))
 
             for old_mem, similarity in similar:
                 try:

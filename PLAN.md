@@ -1,124 +1,113 @@
-# Improvement Plan — Memory Service v7 → v8
+# Improvement Plan — Memory Service v9
 
-## Current State: ~8.9/10 estimated, fragile in several eval dimensions
-
-After full codebase audit, here are **6 prioritized improvements** ranked by eval score impact.
+Based on audit against challenge description (§3–§9). Priority-ordered.
 
 ---
 
-## P1. Query Rewriting for Multi-Hop Recall (CRITICAL)
+## Phase 1 — Critical Fixes (eval blockers)
 
-**Problem:** The recall pipeline passes the raw query to both embedding and BM25. For multi-hop queries like *"What city does the user with the golden retriever live in?"*, the embedding captures the entire sentence's semantics but doesn't decompose it into the sub-intents needed to find both the pet fact AND the location fact.
+### 1.1 Token budget overflow
+- **Problem:** `estimate_tokens(text) = len(text) // 3` — грубая эвристика. Markdown-heavy context (bold keys, lists, headers) может превысить `max_tokens` в 1.5–2x
+- **Fix:** Переписать `_assemble_context` с char budget = `max_tokens * 3`, а не `* 4`. Добавить hard cap в конце: если `estimate_tokens(context) > max_tokens * 1.2`, обрезать с `...`
+- **Files:** `src/services/recall_service.py`
+- **Risk if skipped:** eval проверяет `context` length vs `max_tokens`, fail на tight budgets (256)
 
-**Files:** `src/services/llm_service.py`, `src/services/recall_service.py`, new `src/prompts/query_rewrite.py`
+### 1.2 Race condition on concurrent writes
+- **Problem:** `get_active_by_key` → `deactivate` → `create` не атомарна. Два параллельных `POST /turns` для одного `user_id` могут создать дубликаты memories
+- **Fix:** Добавить `SELECT ... FOR UPDATE` в `get_active_by_key` (row-level lock). Обернуть contradiction resolve в DB transaction с `SELECT FOR UPDATE` на memory rows
+- **Files:** `src/repositories/memory_repo.py`, `src/services/extraction_service.py`
+- **Risk if skipped:** eval запускает concurrent sessions для одного user_id — возможны duplicate active memories
 
-**Fix:**
-1. Add LLM query-rewriting step before `_hybrid_search`
-2. Decompose complex queries into 2-3 sub-queries
-3. Each sub-query gets its own embedding/BM25 search
-4. Results merged via RRF
-5. Simple queries pass through unchanged (low-cost gate)
-
-**Impact:** Multi-hop recall from ~7/10 → ~9/10. This is the eval's hardest category.
-
----
-
-## P2. Multi-Hop-Aware Reranker (CRITICAL)
-
-**Problem:** The current reranker (`src/prompts/rerank.py`) only reorders by relevance. It doesn't explicitly reason about *which memories together* answer the query. For multi-hop, you need memory A (pet: golden retriever) AND memory B (location: Berlin) — neither alone is sufficient.
-
-**Files:** `src/prompts/rerank.py`, `src/services/llm_service.py`, `src/services/recall_service.py`
-
-**Fix:**
-1. Update reranker prompt to ask: "Which memories, when combined, answer the query?"
-2. Return grouped results with a `reasoning` field explaining connections
-3. Prioritize memory pairs/groups that jointly answer the query over individually relevant ones
-4. Keep ranked_indices output for backward compatibility
-
-**Impact:** Multi-hop recall + precision improvement.
+### 1.3 Search schema compliance
+- **Problem:** `SearchResult` содержит `key: str | None` и `type: str | None` — не в контракте §3. Eval может делать strict schema validation
+- **Fix:** Убрать `key` и `type` из базового `SearchResult`. Если нужны — возвращать внутри `metadata: {"key": "...", "type": "..."}` что соответствует контракту
+- **Files:** `src/schemas/search.py`, `src/services/search_service.py`
+- **Risk if skipped:** contract compliance downgrade
 
 ---
 
-## P3. Cross-Key Contradiction Detection (HIGH)
+## Phase 2 — High-Impact Improvements
 
-**Problem:** Contradictions are only detected for memories sharing the exact same `key`. But the LLM might assign slightly different keys to semantically the same topic (e.g., `employer` vs `occupation`, `location` vs `city`). Also, when employer changes, the title may need updating too.
+### 2.1 Opinion arc preservation
+- **Problem:** Для nuance relationship, старое memory деактивировано. Но challenge §4 говорит opinion evolution — это arc: "I love TS" → "generics annoying" → "fine for big projects". Eval может проверять что ВСЯ arc видима в `/memories`
+- **Fix:** Для nuance: НЕ деактивировать старое. Оба активны. В recall context assembly показывать evolution chain: "Loves TS → generics annoying → fine for big projects". В `format_relevant_memories` собирать chain по `supersedes`
+- **Files:** `src/services/extraction_service.py` (nuance branch), `src/services/recall_service.py` (`format_relevant_memories`)
+- **Risk if skipped:** fact evolution score downgrade
 
-**Files:** `src/services/extraction_service.py`, `src/repositories/memory_repo.py`
+### 2.2 Multi-hop query rewrite robustness
+- **Problem:** Gate `len(query.split()) <= 4` пропускает короткие multi-hop queries ("Biscuit's city?" = 2 слова) и декомпозирует длинные однофактные
+- **Fix:** Убрать length gate. ВСЕ queries отправлять на rewrite LLM. Добавить cost gate: если LLM сказал `is_multi_hop: false`, использовать оригинальный query. Сохранить batch embedding
+- **Files:** `src/services/recall_service.py` (`_rewrite_query`)
+- **Risk if skipped:** multi-hop recall miss на коротких queries
 
-**Fix:**
-1. After extraction, run secondary check: compare each new memory against ALL active memories for the user (not just same-key)
-2. Use lightweight embedding similarity check (cosine > 0.8) to identify potentially conflicting memories
-3. Run contradiction classifier on high-similarity pairs
-4. Only run for `fact` and `preference` types (opinions/events rarely contradict)
-
-**Impact:** Fact evolution accuracy, especially for edge cases the eval likely tests.
-
----
-
-## P4. Refine Context Assembly — Stricter Noise Gating (HIGH)
-
-**Problem:** `get_relevant_facts()` uses `min_similarity=0.25` which is quite low. For truly unrelated queries, this threshold can still leak 1-2 marginally similar facts. Also, the stable facts section always allocates 35% of budget even when only 1-2 facts are relevant.
-
-**Files:** `src/services/recall_service.py`, `src/repositories/memory_repo.py`
-
-**Fix:**
-1. Raise `min_similarity` from 0.25 to 0.35
-2. Add "relevance density" check: if < 30% of stable facts pass the threshold, skip the stable facts section entirely (query-relevant section already handles them)
-3. Dynamic budget allocation: if stable facts section is skipped, redistribute budget to query-relevant (60%) and recent context (40%)
-
-**Impact:** Noise resistance from ~9/10 → ~9.5/10. Prevents edge-case leaks.
+### 2.3 Cross-key contradiction threshold tuning
+- **Problem:** Порог 0.80 может быть слишком высоким для логически связанных но семантически разных ключей (например `employer` vs `occupation`)
+- **Fix:** Снизить до 0.70. Добавить whitelist пар ключей которые всегда проверяются: `(employer, title)`, `(employer, occupation)`, `(location, city)`, `(spouse, spouse_occupation)`
+- **Files:** `src/services/extraction_service.py`, `src/repositories/memory_repo.py`
+- **Risk if skipped:** cross-key contradictions miss
 
 ---
 
-## P5. Search Endpoint Improvements (MEDIUM)
+## Phase 3 — Polish & Edge Cases
 
-**Problem:** The `/search` endpoint does hybrid search + RRF but doesn't rerank. Also, BM25 `plainto_tsquery` doesn't handle phrase queries or negation well.
+### 3.1 Missing `source_turn` field in memories response
+- **Problem:** Контракт §3 показывает `source_turn: "string"` в memories response, но `MemoryOut` имеет только `source_session`. Eval может проверять это поле
+- **Fix:** Добавить `source_turn: str | None` в `MemoryOut` из `memory.source_turn_id`
+- **Files:** `src/schemas/memory.py`, `src/routers/memories.py`
+- **Risk if skipped:** minor contract compliance hit
 
-**Files:** `src/services/search_service.py`, `src/repositories/memory_repo.py`
+### 3.2 Recall fixture expansion
+- **Problem:** 12 probe queries — хорошо, но нет explicit tests для: correction handling, implicit fact extraction, tight token budget (256), multi-message turns с tool calls
+- **Fix:** Добавить 6-8 probe queries в fixture:
+  - "What framework correction did the user make?" (correction)
+  - "Does the user have any pets mentioned indirectly?" (implicit)
+  - probe с `max_tokens: 128` (tight budget)
+  - multi-message turn с tool call
+- **Files:** `fixtures/conversations.json`, `tests/recall_quality/test_recall_fixture.py`
+- **Risk if skipped:** lower recall quality metric on private eval
 
-**Fix:**
-1. Add LLM reranking to `/search` (top-10 candidates)
-2. Switch BM25 to `websearch_to_tsquery` with `plainto_tsquery` fallback for better multi-word handling
-3. Consider returning `key` and `type` in search results for richer output
+### 3.3 Rule-based extraction fallback
+- **Problem:** Если OpenAI API недоступен, extraction полностью отключается. Challenge §5: "LLM usage is encouraged" но не required
+- **Fix:** Добавить regex/pattern-based extractor как fallback:
+  - "I (live|lived|moved to) in/at/from X" → location fact
+  - "I (work|worked|joined) at X" → employer fact
+  - "I'm allergic to X" → allergy fact
+  - "my (dog|cat|pet) named X" → pet fact
+- **Files:** новый `src/services/rule_extractor.py`, `src/services/extraction_service.py` (fallback)
+- **Risk if skipped:** resilience when API down
 
-**Impact:** Search quality improvement — eval may test this.
+### 3.4 Temporal boost in recall
+- **Problem:** Нет boost для недавних memories в hybrid search. Recency обрабатывается только в context assembly (recent turns)
+- **Fix:** Добавить recency factor в RRF score: `rrf_score * (1 + alpha * recency)` где `recency = 1 / (1 + days_since_creation)`, `alpha = 0.1`
+- **Files:** `src/services/recall_service.py` (`rrf_merge`)
+- **Risk if skipped:** stale facts may outrank recent corrections
 
 ---
 
-## P6. Documentation Update (MEDIUM)
+## Phase 4 — Documentation & Testing
 
-**Files:** `CHANGELOG.md`, `README.md`
+### 4.1 Verify `.env.example` exists and is correct
+- Challenge §6 требует `.env.example` с API keys
+- Убедиться что файл содержит все переменные из `config.py`
 
-**Fix:**
-1. Add v8 CHANGELOG entry with metrics for all changes
-2. Update README with query rewriting architecture, multi-hop handling description
-3. Update architecture diagram if needed
+### 4.2 Update CHANGELOG with v9 entry
+- Описать все изменения из Phase 1-3
+- Включить метрики до/после
+
+### 4.3 Update README
+- Обновить opinion evolution section (arc preservation)
+- Обновить recall strategy (improved noise gating thresholds)
+- Добавить rule-based fallback mention
 
 ---
 
-## Implementation Order
+## Execution Order
 
-| Order | Task | Priority | Estimated Impact |
-|-------|------|----------|-----------------|
-| 1 | P1: Query Rewriting | CRITICAL | Multi-hop +2pts |
-| 2 | P2: Multi-Hop Reranker | CRITICAL | Multi-hop +1.5pts |
-| 3 | P3: Cross-Key Contradiction | HIGH | Fact evolution +1pt |
-| 4 | P4: Noise Gating Refinement | HIGH | Noise resistance +0.5pt |
-| 5 | P5: Search Improvements | MEDIUM | Search quality +0.5pt |
-| 6 | P6: Documentation | MEDIUM | Human review score |
+```
+1.1 → 1.2 → 1.3 → 2.1 → 2.2 → 2.3 → 3.1 → 3.2 → 3.3 → 3.4 → 4.x
+```
 
-## Expected Eval Impact
-
-| Category | v7 Score | v8 Expected |
-|----------|----------|-------------|
-| Recall quality | 8 | 9.5 |
-| Fact evolution | 9 | 9.5 |
-| Multi-hop | 7 | 9 |
-| Noise resistance | 9 | 9.5 |
-| Extraction quality | 9 | 9.5 |
-| Persistence | 8 | 8 |
-| Cross-session | 9 | 9 |
-| Robustness | 9 | 9 |
-| Correctness | 9 | 9 |
-| Contract | 9.5 | 9.5 |
-| **Overall** | **~8.9** | **~9.5** |
+Phase 1 — must-do перед submission.
+Phase 2 — high impact, рекомендуется.
+Phase 3 — polish, если есть время.
+Phase 4 — final packaging.
