@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 RRF_K = 60
 TEMPORAL_ALPHA = 0.1
 RERANK_TOP_K = 15
-RECALL_RELEVANCE_THRESHOLD = 0.35
-RERANK_NOISE_FLOOR = 0.35
-STABLE_FACTS_MIN_DENSITY = 0.30
+RECALL_RELEVANCE_THRESHOLD = 0.25
+RERANK_NOISE_FLOOR = 0.20
+STABLE_FACTS_MIN_DENSITY = 0.15
 
 
 def estimate_tokens(text: str) -> int:
@@ -79,9 +79,9 @@ def format_stable_facts(memories: list, budget_tokens: int) -> str:
             older = mems[1:]
             evolution = "; ".join(o.value for o in reversed(older))
             if compact:
-                line = f"{newest.key}: {newest.value} (from {evolution})"
+                line = f"{newest.key}: {newest.value}"
             else:
-                line = f"- **{newest.key}**: {newest.value} (evolved from: {evolution})"
+                line = f"- **{newest.key}**: {newest.value} (previously: {evolution})"
 
         if used + len(line) + 1 > budget_chars:
             break
@@ -129,12 +129,10 @@ def format_relevant_memories(
             })
         else:
             newest_mem, newest_score = items[0]
-            older_values = [m.value for m, _ in reversed(items[1:])]
-            evolution = " → ".join(older_values + [newest_mem.value])
             if compact:
-                line = f"[{newest_mem.type}/{key}] {evolution}"
+                line = f"[{newest_mem.type}/{key}] {newest_mem.value}"
             else:
-                line = f"- [{newest_mem.type}/{key}] {evolution}"
+                line = f"- [{newest_mem.type}/{key}] {newest_mem.value}"
             if used + len(line) + 1 > budget_chars:
                 break
             lines.append(line)
@@ -342,31 +340,21 @@ class RecallService:
 
             if max_sim < RECALL_RELEVANCE_THRESHOLD:
                 reranked = []
-            elif max_sim < 0.50:
+            else:
                 reranked = [
                     (m, score) for m, score in reranked
                     if sims[m.id] >= RERANK_NOISE_FLOOR
                 ]
-            else:
-                threshold = max(RERANK_NOISE_FLOOR, max_sim * 0.5)
-                reranked = [
-                    (m, score) for m, score in reranked
-                    if sims[m.id] >= threshold
-                ]
 
-        # Phase 1: Stable facts — with relevance density gating
+        # Phase 1: Stable facts — show user profile when query-relevant results exist
         skip_stable = False
         if not reranked:
             stable_facts = []
             skip_stable = True
         elif query_embedding:
             stable_facts = await self.memory_repo.get_relevant_facts(
-                user_id, query_embedding, min_similarity=RECALL_RELEVANCE_THRESHOLD
+                user_id, query_embedding, min_similarity=STABLE_FACTS_MIN_DENSITY
             )
-            all_stable = await self.memory_repo.get_stable_facts(user_id)
-            if all_stable and len(stable_facts) / len(all_stable) < STABLE_FACTS_MIN_DENSITY:
-                stable_facts = []
-                skip_stable = True
         else:
             stable_facts = await self.memory_repo.get_stable_facts(user_id)
             if not stable_facts:

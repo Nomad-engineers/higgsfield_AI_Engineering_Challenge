@@ -48,7 +48,21 @@ PATTERNS = [
     # --- Location ---
     (
         re.compile(
-            r"(?i)\bI\s+(?:live|am living|am based|reside|moved)\s+(?:in|to)\s+(.+?)(?:\.|,|!|$)"
+            r"(?i)\bI\s+(?:live|am living|am based|reside)\s+(?:in|to)\s+([A-Z][a-zA-Z\s]+?)(?:\s+from|\.|,|!|$)"
+        ),
+        "location",
+        "fact",
+    ),
+    (
+        re.compile(
+            r"(?i)\bI\s+moved\s+(?:to|in)\s+([A-Z][a-zA-Z\s]+?)(?:\s+from|\.|,|!|$)"
+        ),
+        "location",
+        "fact",
+    ),
+    (
+        re.compile(
+            r"(?i)\bI\s+(?:live|am living|am based|reside)\s+(?:in|to)\s+(.+?)(?:\.|,|!|$)"
         ),
         "location",
         "fact",
@@ -214,6 +228,9 @@ class RuleExtractor:
                         dedup_key = (key, pet_name.lower())
                     else:
                         value = groups[0].strip()
+                        # Clean up location values: strip "from X" clauses
+                        if key == "location":
+                            value = re.sub(r"\s+from\s+\S+.*$", "", value, flags=re.IGNORECASE).strip()
                         dedup_key = (key, value.lower())
 
                     # Skip false occupation matches

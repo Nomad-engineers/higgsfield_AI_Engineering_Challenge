@@ -25,7 +25,7 @@ use the corrected value and note the correction in the value text.
 { type: "fact", key: "pet", value: "Has a dog named Biscuit" }
 7. Return empty array if nothing extractable.
 8. Include relevant temporal context in the value: "just moved" → note recency \
-in the value string.
+in the value string. But do NOT include the previous location — only the current one.
 9. For opinions, capture the full nuance: "I love Python but TypeScript is \
 fine for big projects" → separate into preference for Python and opinion on \
 TypeScript, OR one preference entry capturing the nuance.
@@ -59,11 +59,13 @@ relationship (spouse) and the name together in one memory.
 
 Examples:
 - "I just moved to Berlin from NYC last month" →
-  { type: "fact", key: "location", value: "Lives in Berlin, moved from NYC (recently, ~1 month ago)", confidence: 0.95 }
+  { type: "fact", key: "location", value: "Lives in Berlin (moved recently, ~1 month ago)", confidence: 0.95 }
+  NOTE: Only extract the CURRENT location. Do NOT include the previous location \
+("from NYC") in the value — the contradiction pipeline tracks prior values.
 - "I just moved to Berlin from NYC. Loving it so far." →
-  { type: "fact", key: "location", value: "Lives in Berlin, moved from NYC recently; enjoying it", confidence: 0.95 }
+  { type: "fact", key: "location", value: "Lives in Berlin (recently moved); enjoying it", confidence: 0.95 }
   NOTE: Do NOT create a separate opinion/preference about Berlin — the sentiment \
-is folded into the location fact.
+is folded into the location fact. Do NOT include "from NYC".
 - "I love Python but honestly TypeScript is fine for big projects" →
   { type: "preference", key: "programming_language", value: "Loves Python; thinks TypeScript is fine for large projects", confidence: 0.9 }
 - "my 3-year-old daughter loves Frozen" →
