@@ -13,6 +13,8 @@ import time
 
 import httpx
 import pytest
+
+pytestmark = pytest.mark.integration
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 

@@ -1,10 +1,12 @@
 """Contract tests for all API endpoints.
 
 Tests correct status codes, response shapes, and basic behavior.
-Runs against the live Docker Compose stack.
+Runs against the live Docker Compose stack. Auto-skipped if server is unreachable.
 """
 import pytest
 import httpx
+
+pytestmark = pytest.mark.integration
 
 BASE_URL = "http://localhost:8080"
 

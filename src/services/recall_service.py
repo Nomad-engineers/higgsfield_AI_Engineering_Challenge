@@ -10,6 +10,7 @@ from src.config import settings
 from src.repositories.memory_repo import MemoryRepo
 from src.repositories.turn_repo import TurnRepo
 from src.services.llm_service import llm_service
+from src.services.query import analyze_query, expand_query_for_bm25
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,8 @@ RERANK_TOP_K = 15
 RECALL_RELEVANCE_THRESHOLD = 0.25
 RERANK_NOISE_FLOOR = 0.20
 STABLE_FACTS_MIN_DENSITY = 0.15
+KEY_MATCH_BOOST = 2.0
+SESSION_BOOST_ALPHA = 0.05
 
 
 def estimate_tokens(text: str) -> int:
@@ -26,7 +29,11 @@ def estimate_tokens(text: str) -> int:
 
 
 def rrf_merge(
-    vector_results: list[tuple], bm25_results: list[tuple], k: int = RRF_K
+    vector_results: list[tuple],
+    bm25_results: list[tuple],
+    key_results: list[tuple] | None = None,
+    k: int = RRF_K,
+    session_id: str | None = None,
 ) -> list[tuple]:
     scores: dict[uuid.UUID, float] = {}
     memories: dict[uuid.UUID, object] = {}
@@ -40,6 +47,12 @@ def rrf_merge(
         scores[memory.id] = scores.get(memory.id, 0) + 1.0 / (k + rank + 1)
         memories[memory.id] = memory
 
+    if key_results:
+        for rank, (memory, _score) in enumerate(key_results):
+            boost = KEY_MATCH_BOOST / (k + rank + 1)
+            scores[memory.id] = scores.get(memory.id, 0) + boost
+            memories[memory.id] = memory
+
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     result = []
     for mid, score in ranked:
@@ -47,6 +60,9 @@ def rrf_merge(
         days_old = (now - mem.created_at).days if mem.created_at else 0
         recency = 1.0 / (1.0 + days_old)
         adjusted = score * (1 + TEMPORAL_ALPHA * recency)
+        # Same-session boost: memories from the active session get a small advantage
+        if session_id and hasattr(mem, 'source_session') and mem.source_session == session_id:
+            adjusted *= (1 + SESSION_BOOST_ALPHA)
         result.append((mem, adjusted))
     return result
 
@@ -189,7 +205,7 @@ class RecallService:
 
         # No LLM key — BM25-only recall
         if not settings.llm_available:
-            return await self._bm25_fallback_recall(query, user_id, max_tokens)
+            return await self._bm25_fallback_recall(query, user_id, max_tokens, session_id=session_id)
 
         # Query rewriting: decompose multi-hop queries into sub-queries
         sub_queries = await self._rewrite_query(query)
@@ -199,7 +215,7 @@ class RecallService:
             all_embeddings = await llm_service.embed(sub_queries)
         except Exception as e:
             logger.warning(f"Query embedding failed, falling back to BM25: {e}")
-            return await self._bm25_fallback_recall(query, user_id, max_tokens)
+            return await self._bm25_fallback_recall(query, user_id, max_tokens, session_id=session_id)
 
         # Run hybrid search for each sub-query and merge results
         all_vector_results: list[tuple] = []
@@ -214,17 +230,30 @@ class RecallService:
                 if m.id not in similarity_map or sim > similarity_map[m.id]:
                     similarity_map[m.id] = sim
 
-        fused = rrf_merge(all_vector_results, all_bm25_results)
+        # Canonical key matching from hint vocabulary
+        hints = analyze_query(query)
+        key_results = []
+        if hints["hint_keys"]:
+            key_results = await self.memory_repo.key_search(
+                user_id, list(hints["hint_keys"]), limit=10
+            )
+
+        fused = rrf_merge(all_vector_results, all_bm25_results, key_results, session_id=session_id)
         if not fused:
-            return await self._bm25_fallback_recall(query, user_id, max_tokens)
+            logger.info(f"Recall: no fused results (vec={len(all_vector_results)} bm25={len(all_bm25_results)} key={len(key_results)}), query='{query[:50]}'")
+            return await self._bm25_fallback_recall(query, user_id, max_tokens, session_id=session_id)
 
         reranked = await self._rerank(query, fused, sub_queries)
 
         query_embedding = all_embeddings[0]
 
+        key_ids = {m.id for m, _ in key_results} if key_results else None
+
         return await self._assemble_context(
             query, user_id, reranked, session_id, max_tokens,
             query_embedding, similarity_map,
+            bm25_ids={m.id for m, _ in all_bm25_results},
+            key_ids=key_ids,
         )
 
     async def _rewrite_query(self, query: str) -> list[str]:
@@ -308,7 +337,6 @@ class RecallService:
         if not grouped_indices:
             return reranked
 
-        # Ensure all group members are present, then append any missing at the front
         seen_ids = {id(top_k[i][0]) for i in seen if 0 <= i < len(top_k)}
         group_items = []
         for idx in sorted(grouped_indices):
@@ -328,32 +356,65 @@ class RecallService:
         max_tokens: int,
         query_embedding: list[float] | None = None,
         similarity_map: dict | None = None,
+        bm25_ids: set | None = None,
+        key_ids: set | None = None,
     ) -> tuple[str, list[dict]]:
         budget = max_tokens
         sections = []
         citations = []
 
         # Gate query-relevant results by vector similarity
+        # Authority signals: key_ids (direct key match) > vector sim > bm25_ids
+        has_authoritative = key_ids and any(m.id in key_ids for m, _ in reranked)
+        max_sim = 0.0
         if similarity_map and reranked:
             sims = {m.id: similarity_map.get(m.id, 0) for m, _ in reranked}
             max_sim = max(sims.values())
 
             if max_sim < RECALL_RELEVANCE_THRESHOLD:
-                reranked = []
+                if key_ids:
+                    reranked = [
+                        (m, score) for m, score in reranked
+                        if m.id in key_ids
+                    ]
+                elif bm25_ids:
+                    reranked = [
+                        (m, score) for m, score in reranked
+                        if m.id in bm25_ids
+                    ]
+                else:
+                    reranked = []
             else:
                 reranked = [
                     (m, score) for m, score in reranked
                     if sims[m.id] >= RERANK_NOISE_FLOOR
+                    or (key_ids and m.id in key_ids)
+                    or (bm25_ids and m.id in bm25_ids)
                 ]
+
+        logger.info(
+            f"Recall gate: reranked={len(reranked)}, max_sim={max_sim:.3f}"
+        )
 
         # Phase 1: Stable facts — show user profile when query-relevant results exist
         skip_stable = False
         if not reranked:
             stable_facts = []
             skip_stable = True
+        elif similarity_map and query_embedding:
+            best_sim = max(similarity_map.get(m.id, 0) for m, _ in reranked) if reranked else 0
+            has_key_match = key_ids and any(m.id in key_ids for m, _ in reranked)
+            has_bm25 = bm25_ids and any(m.id in bm25_ids for m, _ in reranked)
+            if best_sim < RECALL_RELEVANCE_THRESHOLD and not has_key_match and not has_bm25:
+                stable_facts = []
+                skip_stable = True
+            else:
+                stable_facts = await self.memory_repo.get_relevant_facts(
+                    user_id, query_embedding, min_similarity=STABLE_FACTS_MIN_DENSITY
+                )
         elif query_embedding:
             stable_facts = await self.memory_repo.get_relevant_facts(
-                user_id, query_embedding, min_similarity=STABLE_FACTS_MIN_DENSITY
+                user_id, query_embedding, min_similarity=RECALL_RELEVANCE_THRESHOLD
             )
         else:
             stable_facts = await self.memory_repo.get_stable_facts(user_id)
@@ -390,7 +451,6 @@ class RecallService:
 
         context = "\n\n".join(s for s in sections if s)
 
-        # Hard cap: ensure we don't exceed max_tokens by more than 20%
         max_chars = int(max_tokens * 3 * 1.2)
         if len(context) > max_chars:
             context = context[:max_chars] + "..."
@@ -398,15 +458,26 @@ class RecallService:
         return context, citations
 
     async def _bm25_fallback_recall(
-        self, query: str, user_id: str, max_tokens: int
+        self, query: str, user_id: str, max_tokens: int,
+        session_id: str | None = None,
     ) -> tuple[str, list[dict]]:
         """BM25-based recall when embeddings/LLM are unavailable."""
-        bm25_results = await self.memory_repo.bm25_search(user_id, query, limit=20)
+        hints = analyze_query(query)
+        expanded_query = expand_query_for_bm25(query)
 
-        if not bm25_results:
+        bm25_results = await self.memory_repo.bm25_search(user_id, expanded_query, limit=20)
+
+        # Canonical key matching
+        key_results = []
+        if hints["hint_keys"]:
+            key_results = await self.memory_repo.key_search(
+                user_id, list(hints["hint_keys"]), limit=10
+            )
+
+        if not bm25_results and not key_results:
             return "", []
 
-        fused = rrf_merge([], bm25_results)
+        fused = rrf_merge([], bm25_results, key_results, session_id=session_id)
 
         budget = max_tokens
         sections = []

@@ -12,6 +12,8 @@ import time
 import httpx
 import pytest
 
+pytestmark = pytest.mark.integration
+
 BASE_URL = "http://localhost:8080"
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "fixtures")
 

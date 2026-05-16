@@ -93,6 +93,41 @@ class MemoryRepo:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def key_search(self, user_id: str, keys: list[str],
+                        limit: int = 20) -> list[tuple[Memory, float]]:
+        """Direct SQL match on memory key column — deterministic recall boost."""
+        if not keys:
+            return []
+        placeholders = ", ".join(f":k{i}" for i in range(len(keys)))
+        params = {f"k{i}": k for i, k in enumerate(keys)}
+        params["user_id"] = user_id
+        params["limit"] = limit
+
+        stmt = text(f"""
+            SELECT id, user_id, type, key, value, confidence, source_session,
+                   source_turn_id, supersedes, active, created_at, updated_at
+            FROM memories
+            WHERE user_id = :user_id
+              AND active = TRUE
+              AND key IN ({placeholders})
+            ORDER BY created_at DESC
+            LIMIT :limit
+        """)
+        result = await self.session.execute(stmt, params)
+        rows = result.fetchall()
+        memories = []
+        for row in rows:
+            m = Memory(
+                id=row.id, user_id=row.user_id, type=row.type, key=row.key,
+                value=row.value, confidence=row.confidence,
+                source_session=row.source_session, source_turn_id=row.source_turn_id,
+                supersedes=row.supersedes, active=row.active,
+                created_at=row.created_at, updated_at=row.updated_at,
+                embedding=None,
+            )
+            memories.append((m, m.confidence))
+        return memories
+
     async def get_recent_by_user(self, user_id: str, limit: int = 10) -> list[Memory]:
         result = await self.session.execute(
             select(Memory)

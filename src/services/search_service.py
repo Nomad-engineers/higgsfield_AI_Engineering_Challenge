@@ -7,6 +7,7 @@ from src.config import settings
 from src.repositories.memory_repo import MemoryRepo
 from src.services.llm_service import llm_service
 from src.services.recall_service import rrf_merge
+from src.services.query import analyze_query, expand_query_for_bm25
 
 logger = logging.getLogger(__name__)
 
@@ -117,9 +118,17 @@ class SearchService:
         return results
 
     async def _fallback_search(self, query: str, user_id: str, limit: int) -> list[dict]:
-        bm25_results = await self.memory_repo.bm25_search(user_id, query, limit=limit)
+        expanded_query = expand_query_for_bm25(query)
+        bm25_results = await self.memory_repo.bm25_search(user_id, expanded_query, limit=limit)
 
-        if not bm25_results:
+        hints = analyze_query(query)
+        key_results = []
+        if hints["hint_keys"]:
+            key_results = await self.memory_repo.key_search(
+                user_id, list(hints["hint_keys"]), limit=limit
+            )
+
+        if not bm25_results and not key_results:
             memories = await self.memory_repo.get_recent_by_user(user_id, limit=limit)
             results = []
             for m in memories:
@@ -132,8 +141,10 @@ class SearchService:
                 })
             return results
 
+        fused = rrf_merge([], bm25_results, key_results)
+
         results = []
-        for memory, score in bm25_results[:limit]:
+        for memory, score in fused[:limit]:
             results.append({
                 "content": f"{memory.key}: {memory.value}",
                 "score": round(score, 4),

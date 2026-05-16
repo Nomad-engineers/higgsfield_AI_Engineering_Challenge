@@ -60,9 +60,9 @@ Total cost per turn: ~$0.0003 (extraction + contradiction + embedding). Total co
 
 Raw conversation turns are processed into structured memories via a two-track extraction system (rules + LLM):
 
-1. **Persist turn** to PostgreSQL — short transaction, committed before any LLM calls
-2. **Rule-based extraction** — always runs, no API key needed. 16 regex patterns covering location, employment, pets, allergies, diet, communication style, preferences, name, and corrections. Subject gate: only extracts from `role=user` messages. Key normalization via alias map (company→employer, city→location, job→occupation). Confidence scoring based on key specificity and value length.
-3. **LLM extraction** — runs in parallel when `OPENAI_API_KEY` is set. Structured JSON output via GPT-4o-mini with type (`fact|preference|opinion|event`), normalized key, atomic value, and confidence score. Rejects passing observations and distinguishes desires from facts.
+1. **Validate and persist turn** — ISO-8601 timestamp validation via Pydantic `field_validator`, then persist to PostgreSQL in a short transaction committed before any LLM calls
+2. **Rule-based extraction** — always runs, no API key needed. 20 regex patterns covering location (3 patterns with capital-letter matching and "from X" cleanup), employment (3), pets (3 including implicit detection like "walking Biscuit"), allergies (1), diet (2), communication style (2), preferences (1), name (1), corrections (1 with key inference), and fallback occupation (1 with stop-word filtering). Subject gate: only extracts from `role=user` messages. Key normalization via alias map (company→employer, city→location, job→occupation). Confidence scoring based on key specificity and value length. Correction key inference: `actually, I live in Paris` maps to `location` instead of generic `correction`.
+3. **LLM extraction** — runs in parallel when `OPENAI_API_KEY` is set. Structured JSON output via GPT-4o-mini with type (`fact|preference|opinion|event`), normalized key, atomic value, and confidence score (clamped to 0.0–1.0). 18-rule prompt covering: implicit facts, corrections, compound statements, temporal context (current location only, no prior values), passing observation rejection, desire vs. fact distinction, tool message extraction, named entity context, and conversational redirect filtering.
 4. **Merge** — LLM wins on key conflict (richer values), rules fill gaps when LLM misses or is unavailable.
 5. **Same-turn deduplication** — if multiple memories share the same key from one message, merge into one memory (preferring `fact` over `opinion`). Prevents broken supersession chains.
 6. **Contradiction check** — compare ONLY against the most recent existing memory for the same key. LLM classifies: `new`, `update`, `contradiction`, `correction`, or `nuance`. Separates sentiment from fact.
@@ -83,14 +83,14 @@ All Pydantic schemas use `extra="forbid"` — unknown fields in request bodies a
 3. **BM25 search** — pre-computed `tsvector` column with GIN index + `websearch_to_tsquery` (falls back to `plainto_tsquery`), top-20 candidates per sub-query
 4. **Reciprocal Rank Fusion** (k=60) — merge all sub-query result sets, deduplicate by memory ID
 5. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking with multi-hop reasoning. Returns grouped memories that jointly answer the query. (Skipped without API key.)
-6. **Noise gating** — adaptive similarity thresholds filter irrelevant results: 0.35 floor, 0.50 breakpoint with stricter filtering below, relevance density check for stable facts
-7. **Context assembly** — format ranked memories into structured text under the token budget, with relevance gating and dynamic budget allocation
+6. **Noise gating** — similarity thresholds filter irrelevant results: 0.30 floor for query-relevant filtering, 0.20 noise floor for reranked results; stable facts skip entirely when no query-relevant results pass the threshold
+7. **Context assembly** — format ranked memories into structured text under the token budget, showing only current values (evolution history preserved in stable facts section but excluded from query-relevant results to save tokens)
 
 ### BM25-only Fallback (no API key)
 
 When `OPENAI_API_KEY` is not set, recall and search operate without embeddings or LLM calls:
 
-- **`/recall`** uses BM25 keyword search to find relevant memories, assembles context with the same token budget priority (stable facts 35%, query-relevant 50%, recent context 15%). Falls back to recent memories if BM25 returns no matches.
+- **`/recall`** uses BM25 keyword search to find relevant memories, assembles context with the same token budget priority (stable facts 35%, query-relevant 50%, recent context 15%). Returns empty context if BM25 returns no matches — avoids dumping irrelevant recent memories.
 - **`/search`** uses BM25 keyword search directly, returning scored results. Falls back to recent memories if BM25 returns no matches.
 - Rule-based extraction still runs, so memories are created and stored — just without LLM enrichment.
 
@@ -100,11 +100,11 @@ When budget is tight, the assembly follows this priority:
 
 | Priority | Allocation | Content | Rationale |
 |----------|-----------|---------|-----------|
-| 1 | 35% (or 0%) | Stable facts (confidence ≥ 0.8, relevant to query) | Compact, high-value, filtered by query similarity (≥ 0.35). Skipped entirely if < 30% of stable facts pass the relevance threshold — budget redistributed to query-relevant (60%) and recent context (40%). |
+| 1 | 35% (or 0%) | Stable facts (confidence ≥ 0.8, relevant to query) | Compact, high-value, filtered by query similarity (≥ 0.30). Skipped entirely when no query-relevant results pass the similarity threshold — budget redistributed to query-relevant (60%) and recent context (40%). |
 | 2 | 50% (or 60%) | Query-relevant memories (reranked) | The query signals what the agent needs right now. Gets 60% when stable facts are skipped. |
 | 3 | 15% (or 40%) | Recent session turns | Verbose and low density, only if budget remains. Gets 40% when stable facts are skipped. |
 
-Stable facts are filtered by relevance to the query — only facts with cosine similarity > 0.35 to the query embedding are included. An adaptive noise floor applies: if the best reranked result has similarity < 0.50, a stricter threshold (0.35) applies to all results; otherwise the threshold adapts to `max(0.35, max_sim * 0.5)`. This prevents dumping the entire user profile when the query is unrelated ("What car does the user drive?" won't include dietary restrictions). Query-relevant memories get the largest share because the recall query is the strongest signal of what the agent needs. Recent conversation context is a fallback — useful but low signal density per token.
+Stable facts are filtered by relevance to the query — only facts with cosine similarity > 0.30 to the query embedding are included. The noise gate works in two stages: (1) query-relevant results below `RECALL_RELEVANCE_THRESHOLD` (0.30) are dropped entirely; (2) surviving results are filtered by `RERANK_NOISE_FLOOR` (0.20). When no results survive, stable facts are skipped and budget is redistributed. This prevents dumping the entire user profile when the query is unrelated ("What car does the user drive?" won't include dietary restrictions). Query-relevant memories get the largest share because the recall query is the strongest signal of what the agent needs. Recent conversation context is a fallback — useful but low signal density per token.
 
 ### Multi-hop Recall
 
@@ -122,10 +122,10 @@ When `user_id` is null, recall operates on session-scoped data only: memories cr
 
 ### Noise Resistance
 
-Irrelevant queries don't dump the entire user profile. The context assembly uses adaptive noise gating:
-- **Relevance threshold** — memories with cosine similarity < 0.35 to the query are filtered out
-- **Adaptive floor** — if the best result has similarity < 0.50, the floor is raised to 0.35 for all results; otherwise it adapts to `max(0.35, max_sim * 0.5)`
-- **Density gating** — if fewer than 30% of stable facts pass the relevance threshold, the entire User Profile section is skipped and its budget redistributed
+Irrelevant queries don't dump the entire user profile. The context assembly uses two-stage noise gating:
+- **Query-relevance threshold** — if the best result has similarity < 0.30 to the query, all results are dropped and empty context is returned
+- **Noise floor** — surviving results below 0.20 similarity are filtered out
+- **Stable fact gating** — when no query-relevant results pass the threshold, the entire User Profile section is skipped and its budget redistributed
 
 An unrelated query like "quantum physics equations" returns empty or minimal context (<300 chars).
 
@@ -155,7 +155,7 @@ This is a deliberate tradeoff: showing all opinions in recall context would cons
 
 **Two-phase commit in `/turns`.** No Celery, no Redis queue. Phase 1 persists the turn and commits immediately. Phase 2 runs extraction (rules + LLM) and commits separately. After `/turns` returns, the turn is always persisted; memories may be missing if extraction fails but no data is lost. Two separate transactions eliminate deadlock risk from holding `SELECT FOR UPDATE` locks during network I/O.
 
-**Dual-track extraction: rules + LLM.** Rule-based extraction (16 regex patterns, user-only gate, key normalization) always runs and works without any API key. LLM extraction adds richer values and broader coverage. LLM wins on key conflict; rules fill gaps when LLM is unavailable or misses a pattern.
+**Dual-track extraction: rules + LLM.** Rule-based extraction (20 regex patterns, user-only gate, key normalization, correction key inference, occupation stop-words) always runs and works without any API key. LLM extraction adds richer values and broader coverage. LLM wins on key conflict; rules fill gaps when LLM is unavailable or misses a pattern.
 
 **Query rewriting with cheap gate.** Queries ≤ 4 words skip the rewrite LLM call entirely. Longer queries are decomposed into sub-queries only when the LLM flags `is_multi_hop: true`. Most queries pass through unchanged.
 
@@ -172,6 +172,7 @@ This is a deliberate tradeoff: showing all opinions in recall context would cons
 | OpenAI API down | `/turns` persists the turn, rule-based extraction still runs, returns 201. LLM extraction logged as warning. |
 | Missing OPENAI_API_KEY | Service starts, `/turns` works with rule-based extraction only, `/recall` uses BM25-only fallback |
 | Malformed JSON | 422 Unprocessable Entity from Pydantic validation (strict `extra="forbid"`) |
+| Invalid timestamp | 422 Unprocessable Entity — ISO-8601 validation via `field_validator` |
 | Unicode content | PostgreSQL handles UTF-8 natively, no special handling needed |
 | Oversized payload | FastAPI default body size limit applies |
 | Delete nonexistent | 204 No Content (idempotent) |

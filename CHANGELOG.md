@@ -369,3 +369,109 @@ Both services check `settings.llm_available` at the entry point and route to BM2
 | Correctness | 9 | 9 |
 | Contract | 9.5 | 10 |
 | **Overall** | **~9.5** | **~9.7** |
+
+---
+
+## v10 — Timestamp validation, correction inference, and opinion evolution
+
+**What changed:** 6 targeted improvements focused on input validation, rule extraction accuracy, and noise reduction.
+
+### P1 — ISO-8601 timestamp validation
+
+Added `field_validator("timestamp")` to `TurnCreate` schema. Invalid timestamps (non-ISO-8601 strings) return 422 Unprocessable Entity. Handles `Z` suffix by converting to `+00:00` for Python's `fromisoformat`.
+
+**Files:** `src/schemas/turn.py`
+
+### P2 — Confidence normalization
+
+Clamped all extraction confidence values to `[0.0, 1.0]` before storage. Previously, malformed LLM responses could produce out-of-range values.
+
+**Files:** `src/services/extraction_service.py`
+
+### P3 — BM25 fallback noise reduction
+
+When BM25 search returns zero results, `/recall` now returns `("", [])` instead of falling back to recent memories. Previously, an unmatched BM25 query would dump the last 5 memories regardless of relevance.
+
+**Files:** `src/services/recall_service.py`
+
+### P4 — Correction key inference in rule extractor
+
+Added `_infer_correction_key()` with 8 regex patterns to detect the real key from correction text. "actually, I live in Paris" now maps to `location` instead of staying as generic `correction`. Without this, corrections couldn't trigger proper supersession chains because the key didn't match the existing memory.
+
+**Files:** `src/services/rule_extractor.py`
+
+### P5 — Occupation stop-words
+
+Added `OCCUPATION_STOP_WORDS` (bit, huge, big, little, lot, great, avid, etc.) to filter false occupation matches from the fallback `I'm a ...` pattern. "I'm a bit tired" no longer extracts `occupation: "bit tired"`.
+
+**Files:** `src/services/rule_extractor.py`
+
+### P6 — Opinion evolution documentation
+
+Added "Opinion Evolution" section to README explaining how the supersession chain tracks opinion arcs, the deliberate tradeoff of showing only the latest stance in recall, and how `/memories` exposes the full history.
+
+**Files:** `README.md`
+
+---
+
+**Why:** Timestamp validation prevents malformed data from silently entering the system. Correction inference was a blind spot — corrections extracted as `correction` key couldn't supersede existing memories with the real key. BM25 fallback was noisy for zero-match queries. Combined, these tighten the service's input boundaries and extraction accuracy.
+
+**Result:**
+- Invalid timestamps rejected with 422 (not silently accepted)
+- Corrections like "actually, I live in Paris" now properly supersede existing `location` memories
+- BM25 unmatched queries return empty context instead of recent memory dump
+- No more false occupation extractions from casual speech patterns
+
+---
+
+## v11 — Extraction prompt tuning, location regex cleanup, recall threshold rebalancing
+
+**What changed:** 4 targeted improvements to extraction accuracy and recall noise gating.
+
+### P1 — Current-location-only extraction
+
+Updated extraction prompt to explicitly forbid including previous locations in extracted values. "I just moved to Berlin from NYC" now extracts `value: "Lives in Berlin (moved recently, ~1 month ago)"` — no "from NYC". The contradiction pipeline tracks the relationship to old values; including them in the new value creates duplicate/conflicting data.
+
+Also updated location examples to demonstrate the separation: extract the CURRENT location only, with temporal context but not prior locations.
+
+**Files:** `src/prompts/extract.py`
+
+### P2 — Location regex cleanup
+
+Split location regex into 3 patterns with explicit capital-letter matching for the "moved to" case, and added post-match cleanup to strip "from X" clauses from extracted location values. The regex patterns now:
+1. Match `I live/am living/am based/reside in <capitalized>` with `from` exclusion
+2. Match `I moved to/in <capitalized>` with `from` exclusion
+3. Fallback: match `I live/am living/am based/reside in <anything>` without restriction
+
+Post-match cleanup: `re.sub(r"\s+from\s+\S+.*$", "", value)` strips any remaining "from X" clauses.
+
+**Files:** `src/services/rule_extractor.py`
+
+### P3 — Recall threshold rebalancing
+
+Adjusted recall service constants for better noise-resistance vs. recall-coverage balance:
+- `RECALL_RELEVANCE_THRESHOLD`: 0.35 → 0.25 (cast wider net before filtering)
+- `RERANK_NOISE_FLOOR`: 0.35 → 0.20 (lower floor after reranking)
+- `STABLE_FACTS_MIN_DENSITY`: 0.30 → 0.15 (require less density for profile section)
+
+Simplified noise gating: removed the two-tier `max_sim < 0.50` adaptive logic. Now uses a single threshold: if `max_sim < RECALL_RELEVANCE_THRESHOLD`, all results are dropped; otherwise filter by `RERANK_NOISE_FLOOR`.
+
+Stable facts section now only skips when NO query-relevant results pass the threshold, instead of requiring 30% density.
+
+**Files:** `src/services/recall_service.py`
+
+### P4 — Context formatting cleanup
+
+Removed evolution arc display from compact and full context formatting. Previously, query-relevant memories showed full evolution (`value1 → value2 → value3`), consuming budget on stale data. Now shows only the current value. Full format still shows evolution for stable facts (`(previously: ...)`).
+
+**Files:** `src/services/recall_service.py`
+
+---
+
+**Why:** Including previous locations in new extraction values created duplicate data — both the old memory and the new memory mentioned "NYC", confusing the contradiction pipeline. The location regex was too greedy, capturing "from NYC" as part of the current location. Recall thresholds were over-tuned to 0.35/0.30, causing false negatives on related-but-not-identical queries. Context formatting was wasting tokens on evolution arcs.
+
+**Result:**
+- Location extractions are clean: current location only, no "from X" contamination
+- Lower thresholds improve recall coverage without significant noise increase
+- Context formatting is tighter — only current values, no evolution arcs in query-relevant section
+- Stable facts still show previous values for full context
