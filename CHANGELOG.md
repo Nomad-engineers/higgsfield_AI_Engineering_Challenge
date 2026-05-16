@@ -213,20 +213,20 @@ Raised `min_similarity` from 0.25 to 0.35 for both query-relevant filtering and 
 
 ### P5 — Search Endpoint Improvements
 
-Added LLM reranking to `/search` endpoint (top-10 candidates after RRF fusion). Previously, search only did vector + BM25 + RRF — no LLM reordering. Now the same reranker from recall is applied, improving relevance ordering. Switched BM25 from `plainto_tsquery` to `websearch_to_tsquery` with `plainto_tsquery` fallback — handles quoted phrases, negation, and multi-word queries better. Added `key` and `type` fields to `SearchResult` schema for richer structured output.
+Added LLM reranking to `/search` endpoint (top-10 candidates after RRF fusion). Previously, search only did vector + BM25 + RRF — no LLM reordering. Now the same reranker from recall is applied, improving relevance ordering. Switched BM25 from `plainto_tsquery` to `websearch_to_tsquery` with `plainto_tsquery` fallback — handles quoted phrases, negation, and multi-word queries better. `key` and `type` fields are returned inside the `metadata` dict for structured access.
 
 **Files:** `src/services/search_service.py`, `src/repositories/memory_repo.py`, `src/schemas/search.py`
 
-**Search result schema change:**
+**Search result metadata enrichment:**
 ```python
-class SearchResult(BaseModel):
-    content: str
-    score: float
-    session_id: str
-    timestamp: str
-    metadata: dict = {}
-    key: str | None = None    # NEW
-    type: str | None = None   # NEW
+# key and type are passed in metadata:
+SearchResult(
+    content=...,
+    score=...,
+    session_id=...,
+    timestamp=...,
+    metadata={"key": memory.key, "type": memory.type},
+)
 ```
 
 ---

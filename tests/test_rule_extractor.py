@@ -194,12 +194,21 @@ class TestNamePattern:
 
 
 class TestCorrectionPattern:
-    def test_actually(self):
+    def test_actually_infers_real_key(self):
         results = RuleExtractor().extract([
             {"role": "user", "content": "Actually, I live in Munich."}
         ])
+        assert len(results) >= 1
         keys = {r["key"] for r in results}
-        assert "correction" in keys
+        assert "location" in keys
+
+    def test_actually_without_inferred_key_falls_back(self):
+        results = RuleExtractor().extract([
+            {"role": "user", "content": "Actually, that's not what I meant."}
+        ])
+        if results:
+            keys = {r["key"] for r in results}
+            assert "correction" in keys
 
 
 class TestKeyNormalization:

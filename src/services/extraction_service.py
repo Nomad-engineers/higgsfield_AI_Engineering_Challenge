@@ -61,6 +61,7 @@ class ExtractionService:
         to_embed = []
 
         for mem in raw_memories:
+            mem["confidence"] = max(0.0, min(1.0, mem.get("confidence", 1.0)))
             memory = await self._resolve_memory(
                 user_id=user_id,
                 session_id=session_id,
@@ -68,7 +69,7 @@ class ExtractionService:
                 type_=mem["type"],
                 key=mem["key"],
                 value=mem["value"],
-                confidence=mem.get("confidence", 1.0),
+                confidence=mem["confidence"],
             )
             if memory:
                 stored.append(memory)

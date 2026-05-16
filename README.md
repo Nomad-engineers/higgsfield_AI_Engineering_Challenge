@@ -143,6 +143,12 @@ Same-key contradictions compare only against the most recent memory for that key
 
 The supersession chain is fully inspectable via `GET /users/{user_id}/memories` — each memory has `supersedes` and `superseded_by` fields forming a linked list of updates.
 
+### Opinion Evolution
+
+The system tracks opinion arcs via the supersession chain. In recall, only the latest stance is returned (to avoid confusion). The full arc is inspectable via `/users/{user_id}/memories` with timestamps.
+
+This is a deliberate tradeoff: showing all opinions in recall context would consume token budget and could confuse the agent with contradictory statements. Example: "love TS" → "generics annoying" → "fine for big projects" — recall returns only the latest stance, while `/memories` shows the full evolution.
+
 ## Tradeoffs
 
 **Optimized for recall quality, not latency.** Each `/recall` makes 3-4 LLM calls (query rewriting + embedding + reranking + optional cross-key check). This adds ~600ms but significantly improves relevance, especially for multi-hop queries.

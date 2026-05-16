@@ -416,7 +416,7 @@ class RecallService:
         bm25_results = await self.memory_repo.bm25_search(user_id, query, limit=20)
 
         if not bm25_results:
-            return await self._fallback_recall(user_id, max_tokens)
+            return "", []
 
         fused = rrf_merge([], bm25_results)
 

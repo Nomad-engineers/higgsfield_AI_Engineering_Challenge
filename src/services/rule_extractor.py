@@ -16,6 +16,29 @@ KEY_ALIASES = {
     "food_preference": "dietary_restriction",
 }
 
+OCCUPATION_STOP_WORDS = frozenset({
+    "bit", "huge", "big", "little", "lot", "great", "avid", "really",
+    "huge", "massive", "tiny", "bit", "bit", "little",
+})
+
+CORRECTION_KEY_PATTERNS = [
+    (re.compile(r"(?i)\b(?:live|living|based|reside|moved)\s+"), "location"),
+    (re.compile(r"(?i)\b(?:work|working|employed)\s+(?:at|for)"), "employer"),
+    (re.compile(r"(?i)\bname\s+(?:is|'s)\s"), "name"),
+    (re.compile(r"(?i)\b(?:allergic|intolerant)\s+to\s"), "allergy"),
+    (re.compile(r"(?i)\b(?:vegetarian|vegan|pescatarian|keto|paleo|gluten)\b"), "dietary_restriction"),
+    (re.compile(r"(?i)\b(?:have|got|own)\s+a\s+\w+\s+named"), "pet"),
+    (re.compile(r"(?i)\b(?:prefer|like|want)\s+(?:my\s+)?(?:answer|response)"), "communication_style"),
+    (re.compile(r"(?i)\b(?:love|hate|really\s+(?:like|dislike))\s"), "preference"),
+]
+
+
+def _infer_correction_key(text: str) -> str | None:
+    for pattern, key in CORRECTION_KEY_PATTERNS:
+        if pattern.search(text):
+            return key
+    return None
+
 
 def normalize_key(key: str) -> str:
     return KEY_ALIASES.get(key, key)
@@ -192,6 +215,17 @@ class RuleExtractor:
                     else:
                         value = groups[0].strip()
                         dedup_key = (key, value.lower())
+
+                    # Skip false occupation matches
+                    if key == "occupation" and value.split()[0].lower() in OCCUPATION_STOP_WORDS:
+                        continue
+
+                    # For corrections, infer the real key from the corrected text
+                    if key == "correction":
+                        inferred = _infer_correction_key(value)
+                        if inferred:
+                            key = inferred
+                            dedup_key = (key, value.lower())
 
                     if dedup_key in seen:
                         continue

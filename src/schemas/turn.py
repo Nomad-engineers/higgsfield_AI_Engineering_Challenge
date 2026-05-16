@@ -1,4 +1,6 @@
-from pydantic import BaseModel, ConfigDict, Field
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Message(BaseModel):
@@ -15,6 +17,15 @@ class TurnCreate(BaseModel):
     messages: list[Message] = Field(..., min_length=1)
     timestamp: str
     metadata: dict | None = None
+
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, v):
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            raise ValueError("Invalid ISO-8601 timestamp")
+        return v
 
 
 class TurnResponse(BaseModel):
