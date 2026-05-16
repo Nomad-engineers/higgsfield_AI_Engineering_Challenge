@@ -58,12 +58,13 @@ Total cost per turn: ~$0.0003 (extraction + contradiction + embedding). Total co
 Raw conversation turns are processed into structured memories via GPT-4o-mini with `json_schema` response format:
 
 1. **Persist turn** to PostgreSQL
-2. **LLM extraction** — structured JSON output with type (`fact|preference|opinion|event`), normalized key (controlled vocabulary: employer, location, pet, dietary_restriction, etc.), atomic value, and confidence score
-3. **Contradiction check** — for each extracted memory, compare against existing active memories with the same key. LLM classifies the relationship: `new`, `update`, `contradiction`, `correction`, or `nuance`
-4. **Supersession** — for update/contradict/correction: deactivate old memory, create new with `supersedes` chain. For nuance: keep both active, newest gets highest confidence
-5. **Batch embed** — all new memories embedded in one API call (`text-embedding-3-small`, 1536d)
+2. **LLM extraction** — structured JSON output with type (`fact|preference|opinion|event`), normalized key (controlled vocabulary: employer, location, pet, dietary_restriction, etc.), atomic value, and confidence score. Extraction prompt rejects passing observations ("flights are expensive") and distinguishes desires ("wants to learn Rust" → preference, not fact).
+3. **Same-turn deduplication** — if the LLM extracts multiple memories with the same key from one message, merge into one memory (preferring `fact` over `opinion`, combining values). Prevents broken supersession chains.
+4. **Contradiction check** — compare ONLY against the most recent existing memory for the same key. LLM classifies the relationship: `new`, `update`, `contradiction`, `correction`, or `nuance`. Prompt explicitly separates sentiment from fact ("loves living in Berlin" ≠ new location).
+5. **Supersession** — for update/contradict/correction/nuance: deactivate old memory, create new with `supersedes` chain. History preserved via linked list.
+6. **Batch embed** — all new memories embedded in one API call (`text-embedding-3-small`, 1536d)
 
-Extraction handles: explicit facts, implicit facts ("walking Biscuit" → has a dog named Biscuit), corrections ("actually, I meant React Native"), and opinion evolution. Multi-message turns (including tool calls) are handled — the extraction pipeline concatenates all messages and processes them as a single conversation segment.
+Extraction handles: explicit facts, implicit facts ("walking Biscuit" → has a dog named Biscuit), corrections ("actually, I meant React Native"), mixed fact+sentiment statements ("moved to Berlin, loving it" → one location fact), and opinion evolution. Multi-message turns (including tool calls with `name` field) are handled — the extraction pipeline concatenates all messages and processes them as a single conversation segment.
 
 If the OpenAI API is unavailable, the turn is still persisted and extraction fails gracefully with a warning log.
 
@@ -72,10 +73,10 @@ If the OpenAI API is unavailable, the turn is still persisted and extraction fai
 `POST /recall` runs a 5-stage pipeline:
 
 1. **Vector search** — pgvector HNSW cosine similarity, top-20 candidates
-2. **BM25 search** — PostgreSQL `tsvector` + `plainto_tsquery`, top-20 candidates
+2. **BM25 search** — pre-computed `tsvector` column with GIN index + `plainto_tsquery`, top-20 candidates
 3. **Reciprocal Rank Fusion** (k=60) — merge both result sets, deduplicate by memory ID
 4. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking
-5. **Context assembly** — format ranked memories into structured text under the token budget
+5. **Context assembly** — format ranked memories into structured text under the token budget, with relevance gating
 
 ### Token Budget Priority
 
@@ -83,11 +84,11 @@ When budget is tight, the assembly follows this priority:
 
 | Priority | Allocation | Content | Rationale |
 |----------|-----------|---------|-----------|
-| 1 | 35% | Stable facts (confidence ≥ 0.8) | Compact, high-value, prevent redundant questions |
+| 1 | 35% | Stable facts (confidence ≥ 0.8, relevant to query) | Compact, high-value, filtered by query similarity |
 | 2 | 50% | Query-relevant memories (reranked) | The query signals what the agent needs right now |
 | 3 | 15% | Recent session turns | Verbose and low density, only if budget remains |
 
-Stable facts come first because they're the "user profile" — vegetarian, allergic to shellfish, works at Stripe. These are compact (one line each) and almost always relevant. Query-relevant memories get the largest share because the recall query is the strongest signal of what the agent needs. Recent conversation context is a fallback — useful but low signal density per token.
+Stable facts are filtered by relevance to the query — only facts with cosine similarity > 0.25 to the query embedding are included. This prevents dumping the entire user profile when the query is unrelated ("What car does the user drive?" won't include dietary restrictions). Query-relevant memories get the largest share because the recall query is the strongest signal of what the agent needs. Recent conversation context is a fallback — useful but low signal density per token.
 
 ### Multi-hop Recall
 
@@ -97,14 +98,18 @@ For queries like "What city does the user with the dog named Biscuit live in?", 
 
 When `user_id` is null, recall operates on session-scoped data only: memories created in that session and recent turns from the session. No cross-session knowledge is accessed.
 
+### Noise Resistance
+
+Irrelevant queries don't dump the entire user profile. The context assembly gates stable facts by query relevance: only memories with cosine similarity > 0.25 to the query embedding are included in the User Profile section. If the top reranked result is irrelevant, stable facts are skipped entirely. An unrelated query like "quantum physics equations" returns empty or minimal context (<300 chars).
+
 ## Fact Evolution
 
 | Scenario | Example | Handling |
 |----------|---------|----------|
 | Update | "I work at Stripe" → "I just joined Notion" | Old deactivated, new supersedes old. History preserved via chain. |
-| Contradiction | "I love TypeScript" → "I hate TypeScript" | Same as update. Old gets lower confidence. |
+| Contradiction | "I love TypeScript" → "I hate TypeScript" | Same as update. Old deactivated. |
 | Correction | "actually, React Native not React" | Same as update. New value includes correction note. |
-| Nuance | "love TS" → "generics annoying" → "fine for big projects" | All kept active. Newest gets highest confidence. Full arc visible in `/memories` with timestamps. |
+| Nuance | "love TS" → "generics annoying" → "fine for big projects" | Old deactivated, new supersedes. Latest nuance always shown in recall. Full arc visible in `/memories` with timestamps. |
 
 The supersession chain is fully inspectable via `GET /users/{user_id}/memories` — each memory has `supersedes` and `superseded_by` fields forming a linked list of updates.
 
@@ -120,18 +125,24 @@ The supersession chain is fully inspectable via `GET /users/{user_id}/memories` 
 
 **Embeddings on memories table.** Fewer joins = simpler queries, faster recall. Tradeoff: one embedding per memory (sufficient for atomic facts).
 
+**Search endpoint content format.** `/search` returns results with a single `content` field (`"key: value"`) rather than separate `key`/`value`/`type` fields. This follows conventional search API conventions (one text blob per result) and keeps the response compact. Tradeoff: callers that need structured access must parse the content string, or use `/users/{user_id}/memories` instead, which returns fully structured memory objects with all fields. The `/search` endpoint prioritizes search relevance (hybrid vector + BM25 + RRF) and simplicity; `/memories` prioritizes structured browsing of the full memory graph.
+
 ## Failure Modes
 
 | Scenario | Behavior |
 |----------|----------|
 | No memories for user | `/recall` returns `{"context": "", "citations": []}` — 200 OK |
+| Unrelated query | Stable facts filtered by relevance; empty context if nothing matches |
 | OpenAI API down | `/turns` persists the turn, extraction logged as warning, returns 201 |
 | Missing OPENAI_API_KEY | Service starts, `/turns` works without extraction, `/recall` returns empty context |
 | Malformed JSON | 422 Unprocessable Entity from Pydantic validation |
 | Unicode content | PostgreSQL handles UTF-8 natively, no special handling needed |
 | Oversized payload | FastAPI default body size limit applies |
 | Delete nonexistent | 204 No Content (idempotent) |
+| Delete turn with memories | Memory's `source_turn_id` set to NULL via ForeignKey SET NULL |
 | Slow disk | Recall still works from cached HNSW indexes, slight latency increase |
+| LLM rate limit | Retry up to 3 times with capped exponential backoff (max 10s wait) |
+| Reranker returns 0-based indices | Auto-detected and used as-is; 1-based indices converted automatically |
 
 ## How to Run
 

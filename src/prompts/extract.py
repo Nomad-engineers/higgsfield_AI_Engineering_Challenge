@@ -31,10 +31,27 @@ fine for big projects" → separate into preference for Python and opinion on \
 TypeScript, OR one preference entry capturing the nuance.
 10. For compound statements, split into multiple atomic memories: \
 "I live in Berlin and work at Notion" → two separate memories.
+11. Do NOT extract passing observations or generic commentary — only \
+PERSISTENT user attributes. "Flights are expensive" or "the weather is nice" \
+are NOT memories. "I hate flying economy" IS a preference.
+12. Do NOT extract the same information under multiple keys. If a user says \
+"I love living in Berlin", extract ONE memory — either a location fact OR a \
+preference, not both. Prefer the fact when both apply to the same topic in a \
+single statement.
+13. When a statement mixes fact and sentiment about the same topic (e.g., \
+"Just moved to Berlin, loving it so far"), extract the FACT only. The \
+sentiment is secondary and should NOT be a separate memory unless the user \
+explicitly elaborates on their feelings as a standalone preference/opinion.
+14. Desires and aspirations ("I want to...", "I hope to...", "I'd love to...") \
+should use type "preference", NOT "fact". They reflect wants, not current state.
 
 Examples:
 - "I just moved to Berlin from NYC last month" →
   { type: "fact", key: "location", value: "Lives in Berlin, moved from NYC (recently, ~1 month ago)", confidence: 0.95 }
+- "I just moved to Berlin from NYC. Loving it so far." →
+  { type: "fact", key: "location", value: "Lives in Berlin, moved from NYC recently; enjoying it", confidence: 0.95 }
+  NOTE: Do NOT create a separate opinion/preference about Berlin — the sentiment \
+is folded into the location fact.
 - "I love Python but honestly TypeScript is fine for big projects" →
   { type: "preference", key: "programming_language", value: "Loves Python; thinks TypeScript is fine for large projects", confidence: 0.9 }
 - "my 3-year-old daughter loves Frozen" →
@@ -48,6 +65,15 @@ Examples:
   { type: "fact", key: "allergy", value: "Allergic to shellfish", confidence: 0.95 }
 - "we went to Japan last summer" →
   { type: "event", key: "travel", value: "Traveled to Japan last summer", confidence: 0.9 }
+- "flights are so expensive these days" →
+  [] (passing observation, not a user attribute)
+- "I'd love to learn Rust someday" →
+  { type: "preference", key: "programming_language", value: "Wants to learn Rust", confidence: 0.8 }
+  NOTE: desire, NOT fact — user doesn't know Rust yet.
+- "Berlin is amazing, the food scene is incredible" →
+  { type: "opinion", key: "location", value: "Thinks Berlin is amazing, loves the food scene", confidence: 0.85 }
+  NOTE: Only if no prior location fact exists. If user already stated they live \
+in Berlin, do NOT extract this as a separate memory — it's commentary on a known topic.
 """
 
 EXTRACTION_SCHEMA = {
