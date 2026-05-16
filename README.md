@@ -42,6 +42,17 @@ Why not a dedicated vector DB (Qdrant, Milvus): this is a single-user service at
 
 Why HNSW over IVFFlat: no training step required, better recall quality for datasets under 1M rows, works from the first insert.
 
+## LLM Models
+
+| Task | Model | Why |
+|------|-------|-----|
+| Extraction | GPT-4o-mini | Fast, cheap ($0.15/1M input), excellent at structured JSON output via `json_schema` mode. Handles implicit fact extraction and correction detection in a single pass. |
+| Contradiction | GPT-4o-mini | Same model, different prompt. Keeps the stack simple — one model for all reasoning tasks. |
+| Reranking | GPT-4o-mini | LLM-based cross-encoder: receives query + candidates, returns relevance-ranked indices. Better than pure similarity scores for multi-hop queries. |
+| Embeddings | text-embedding-3-small (1536d) | Good quality/cost ratio. Batched per extraction — all new memories embedded in one API call. |
+
+Total cost per turn: ~$0.0003 (extraction + contradiction + embedding). Total cost per recall: ~$0.0002 (query embedding + reranking).
+
 ## Extraction Pipeline
 
 Raw conversation turns are processed into structured memories via GPT-4o-mini with `json_schema` response format:
@@ -52,7 +63,7 @@ Raw conversation turns are processed into structured memories via GPT-4o-mini wi
 4. **Supersession** — for update/contradict/correction: deactivate old memory, create new with `supersedes` chain. For nuance: keep both active, newest gets highest confidence
 5. **Batch embed** — all new memories embedded in one API call (`text-embedding-3-small`, 1536d)
 
-Extraction handles: explicit facts, implicit facts ("walking Biscuit" → has a dog named Biscuit), corrections ("actually, I meant React Native"), and opinion evolution.
+Extraction handles: explicit facts, implicit facts ("walking Biscuit" → has a dog named Biscuit), corrections ("actually, I meant React Native"), and opinion evolution. Multi-message turns (including tool calls) are handled — the extraction pipeline concatenates all messages and processes them as a single conversation segment.
 
 If the OpenAI API is unavailable, the turn is still persisted and extraction fails gracefully with a warning log.
 
@@ -77,6 +88,10 @@ When budget is tight, the assembly follows this priority:
 | 3 | 15% | Recent session turns | Verbose and low density, only if budget remains |
 
 Stable facts come first because they're the "user profile" — vegetarian, allergic to shellfish, works at Stripe. These are compact (one line each) and almost always relevant. Query-relevant memories get the largest share because the recall query is the strongest signal of what the agent needs. Recent conversation context is a fallback — useful but low signal density per token.
+
+### Multi-hop Recall
+
+For queries like "What city does the user with the dog named Biscuit live in?", the system relies on the hybrid search to surface both the "pet: Biscuit" and "location" memories, and the LLM reranker to identify that both are needed to answer the query. No explicit graph traversal — at this scale (single user, hundreds of memories), the LLM reranker is sufficient.
 
 ### Session-only Recall
 
@@ -135,7 +150,7 @@ until curl -sf http://localhost:8080/health; do sleep 1; done
 
 ## How to Run Tests
 
-All tests run against the live Docker stack:
+Contract, robustness, recall quality, and extraction tests run inside the Docker container:
 
 ```bash
 # Contract tests (endpoint shapes, status codes)
@@ -144,14 +159,22 @@ docker compose exec app python -m pytest tests/contract/ -v
 # Recall quality (5 conversations, 12 probe queries)
 docker compose exec app python -m pytest tests/recall_quality/ -v -s
 
-# Persistence (write → restart → recall)
-docker compose exec app python -m pytest tests/persistence/ -v
-
 # Robustness (malformed input, unicode, concurrent sessions)
 docker compose exec app python -m pytest tests/robustness/ -v
 
-# All tests
-docker compose exec app python -m pytest tests/ -v
+# Extraction E2E (full pipeline: post turn -> extraction -> memories)
+docker compose exec app python -m pytest tests/test_extraction_e2e.py -v
+
+# All container-based tests
+docker compose exec app python -m pytest tests/contract/ tests/robustness/ tests/recall_quality/ tests/test_extraction_e2e.py -v
+```
+
+The persistence test must run from the **host** (it restarts the Docker stack, so it can't run inside the container):
+
+```bash
+# Requires pytest + httpx on the host
+pip install pytest httpx
+pytest tests/persistence/ -v
 ```
 
 ## Required API Keys

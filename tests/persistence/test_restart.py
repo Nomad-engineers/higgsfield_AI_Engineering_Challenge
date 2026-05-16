@@ -1,4 +1,12 @@
-"""Persistence test: data survives docker compose restart."""
+"""Persistence test: data survives docker compose restart.
+
+Must be run from the HOST machine (not from inside the container),
+since it restarts the Docker Compose stack.
+
+Usage:
+    pytest tests/persistence/ -v
+"""
+import os
 import subprocess
 import time
 
@@ -6,6 +14,11 @@ import httpx
 import pytest
 
 BASE_URL = "http://localhost:8080"
+PROJECT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def _is_inside_docker():
+    return os.path.exists("/.dockerenv")
 
 
 @pytest.fixture(scope="module")
@@ -25,6 +38,7 @@ def _wait_for_health(client, timeout=60):
     return False
 
 
+@pytest.mark.skipif(_is_inside_docker(), reason="Must run from host — restarts containers")
 def test_data_survives_restart(client):
     # Step 1: Write data
     client.delete("/users/persist-user")
@@ -44,13 +58,13 @@ def test_data_survives_restart(client):
         ["docker", "compose", "down"],
         check=True,
         capture_output=True,
-        cwd="/app",
+        cwd=PROJECT_DIR,
     )
     subprocess.run(
         ["docker", "compose", "up", "-d"],
         check=True,
         capture_output=True,
-        cwd="/app",
+        cwd=PROJECT_DIR,
     )
 
     assert _wait_for_health(client), "Service didn't come up after restart"
