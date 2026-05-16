@@ -480,15 +480,13 @@ class RecallService:
                 else:
                     reranked = []
             elif max_sim < MEDIUM_CONFIDENCE_THRESHOLD:
-                # Marginal similarity — require key match or strong BM25 confirmation
-                if key_ids:
-                    reranked = [
-                        (m, score) for m, score in reranked
-                        if m.id in key_ids
-                        or sims[m.id] >= MEDIUM_CONFIDENCE_THRESHOLD
-                    ]
-                else:
-                    reranked = []
+                # Marginal similarity — require key match, BM25, or passing base threshold
+                reranked = [
+                    (m, score) for m, score in reranked
+                    if sims[m.id] >= RECALL_RELEVANCE_THRESHOLD
+                    or (key_ids and m.id in key_ids)
+                    or (bm25_ids and m.id in bm25_ids)
+                ]
             else:
                 reranked = [
                     (m, score) for m, score in reranked
@@ -511,7 +509,7 @@ class RecallService:
             best_sim = max(similarity_map.get(m.id, 0) for m, _ in reranked) if reranked else 0
             has_key_match = key_ids and any(m.id in key_ids for m, _ in reranked)
             has_bm25 = bm25_ids and any(m.id in bm25_ids for m, _ in reranked)
-            if best_sim < MEDIUM_CONFIDENCE_THRESHOLD and not has_key_match and not has_bm25:
+            if best_sim < RECALL_RELEVANCE_THRESHOLD and not has_key_match and not has_bm25:
                 stable_facts = []
                 skip_stable = True
             else:
