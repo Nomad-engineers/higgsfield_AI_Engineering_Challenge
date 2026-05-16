@@ -247,7 +247,7 @@ class MemoryRepo:
 
     async def get_relevant_facts(
         self, user_id: str, query_embedding: list[float],
-        min_confidence: float = 0.8, min_similarity: float = 0.3,
+        min_confidence: float = 0.8, min_similarity: float = 0.35,
     ) -> list[Memory]:
         stmt = text("""
             SELECT id, user_id, type, key, value, confidence, source_session,

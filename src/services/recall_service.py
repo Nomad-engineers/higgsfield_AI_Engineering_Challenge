@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 
 RRF_K = 60
 RERANK_TOP_K = 15
-RECALL_RELEVANCE_THRESHOLD = 0.25
-RERANK_NOISE_FLOOR = 0.30
+RECALL_RELEVANCE_THRESHOLD = 0.35
+RERANK_NOISE_FLOOR = 0.35
+STABLE_FACTS_MIN_DENSITY = 0.30
 
 
 def estimate_tokens(text: str) -> int:
@@ -326,24 +327,38 @@ class RecallService:
                     if sims[m.id] >= threshold
                 ]
 
-        # Phase 1: Stable facts (35% budget) — only if query-relevant
-        facts_budget = int(budget * 0.35)
+        # Phase 1: Stable facts — with relevance density gating
+        skip_stable = False
         if not reranked:
             stable_facts = []
+            skip_stable = True
         elif query_embedding:
             stable_facts = await self.memory_repo.get_relevant_facts(
                 user_id, query_embedding, min_similarity=RECALL_RELEVANCE_THRESHOLD
             )
+            all_stable = await self.memory_repo.get_stable_facts(user_id)
+            if all_stable and len(stable_facts) / len(all_stable) < STABLE_FACTS_MIN_DENSITY:
+                stable_facts = []
+                skip_stable = True
         else:
             stable_facts = await self.memory_repo.get_stable_facts(user_id)
+            if not stable_facts:
+                skip_stable = True
+
+        if skip_stable:
+            facts_budget = 0
+            relevant_budget = int(budget * 0.60)
+        else:
+            facts_budget = int(budget * 0.35)
+            relevant_budget = int(budget * 0.50)
 
         facts_text = format_stable_facts(stable_facts, facts_budget)
         if facts_text:
             sections.append(facts_text)
         used = estimate_tokens(facts_text)
 
-        # Phase 2: Query-relevant memories (50% budget)
-        relevant_budget = int(budget * 0.50)
+        # Phase 2: Query-relevant memories
+        relevant_budget = min(relevant_budget, budget - used)
         relevant_text, relevant_citations = format_relevant_memories(reranked, relevant_budget)
         if relevant_text:
             sections.append(relevant_text)
