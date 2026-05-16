@@ -16,6 +16,9 @@ A Dockerized memory service that ingests conversation turns, extracts structured
 │  │                  Services                          │   │
 │  │  ExtractionService  RecallService  SearchService   │   │
 │  │  MemoryService      LLMService                    │   │
+│  │                                                    │   │
+│  │  LLM prompts: extract, contradiction,              │   │
+│  │  cross_key_contradiction, query_rewrite, rerank    │   │
 │  └───────────────────────┬───────────────────────────┘   │
 │                          │                                │
 │  ┌───────────────────────▼───────────────────────────┐   │
@@ -87,15 +90,21 @@ When budget is tight, the assembly follows this priority:
 
 | Priority | Allocation | Content | Rationale |
 |----------|-----------|---------|-----------|
-| 1 | 35% | Stable facts (confidence ≥ 0.8, relevant to query) | Compact, high-value, filtered by query similarity |
-| 2 | 50% | Query-relevant memories (reranked) | The query signals what the agent needs right now |
-| 3 | 15% | Recent session turns | Verbose and low density, only if budget remains |
+| 1 | 35% (or 0%) | Stable facts (confidence ≥ 0.8, relevant to query) | Compact, high-value, filtered by query similarity (≥ 0.35). Skipped entirely if < 30% of stable facts pass the relevance threshold — budget redistributed to query-relevant (60%) and recent context (40%). |
+| 2 | 50% (or 60%) | Query-relevant memories (reranked) | The query signals what the agent needs right now. Gets 60% when stable facts are skipped. |
+| 3 | 15% (or 40%) | Recent session turns | Verbose and low density, only if budget remains. Gets 40% when stable facts are skipped. |
 
-Stable facts are filtered by relevance to the query — only facts with cosine similarity > 0.25 to the query embedding are included. This prevents dumping the entire user profile when the query is unrelated ("What car does the user drive?" won't include dietary restrictions). Query-relevant memories get the largest share because the recall query is the strongest signal of what the agent needs. Recent conversation context is a fallback — useful but low signal density per token.
+Stable facts are filtered by relevance to the query — only facts with cosine similarity > 0.35 to the query embedding are included. An adaptive noise floor applies: if the best reranked result has similarity < 0.50, a stricter threshold (0.35) applies to all results; otherwise the threshold adapts to `max(0.35, max_sim * 0.5)`. This prevents dumping the entire user profile when the query is unrelated ("What car does the user drive?" won't include dietary restrictions). Query-relevant memories get the largest share because the recall query is the strongest signal of what the agent needs. Recent conversation context is a fallback — useful but low signal density per token.
 
 ### Multi-hop Recall
 
-For queries like "What city does the user with the dog named Biscuit live in?", the system relies on the hybrid search to surface both the "pet: Biscuit" and "location" memories, and the LLM reranker to identify that both are needed to answer the query. No explicit graph traversal — at this scale (single user, hundreds of memories), the LLM reranker is sufficient.
+For queries like "What city does the user with the dog named Biscuit live in?", the system uses a 3-layer approach:
+
+1. **Query rewriting** — the LLM decomposes the query into ["person has a dog named Biscuit", "where that person lives"]. Each sub-query gets its own embedding + hybrid search.
+2. **Multi-hop reranking** — the reranker prompt explicitly asks which memories, *when combined*, answer the query. It returns `groups` of memories that jointly contribute, with reasoning. Grouped memories are promoted to the top of results.
+3. **Broad recall net** — running multiple sub-queries through both vector and BM25 search casts a wider net, increasing the chance that both the pet fact and location fact surface in the candidate set.
+
+No explicit graph traversal — at this scale (single user, hundreds of memories), query decomposition + LLM reranking is sufficient and avoids graph maintenance overhead.
 
 ### Session-only Recall
 
@@ -103,32 +112,40 @@ When `user_id` is null, recall operates on session-scoped data only: memories cr
 
 ### Noise Resistance
 
-Irrelevant queries don't dump the entire user profile. The context assembly gates stable facts by query relevance: only memories with cosine similarity > 0.25 to the query embedding are included in the User Profile section. If the top reranked result is irrelevant, stable facts are skipped entirely. An unrelated query like "quantum physics equations" returns empty or minimal context (<300 chars).
+Irrelevant queries don't dump the entire user profile. The context assembly uses adaptive noise gating:
+- **Relevance threshold** — memories with cosine similarity < 0.35 to the query are filtered out
+- **Adaptive floor** — if the best result has similarity < 0.50, the floor is raised to 0.35 for all results; otherwise it adapts to `max(0.35, max_sim * 0.5)`
+- **Density gating** — if fewer than 30% of stable facts pass the relevance threshold, the entire User Profile section is skipped and its budget redistributed
+
+An unrelated query like "quantum physics equations" returns empty or minimal context (<300 chars).
 
 ## Fact Evolution
 
 | Scenario | Example | Handling |
 |----------|---------|----------|
-| Update | "I work at Stripe" → "I just joined Notion" | Old deactivated, new supersedes old. History preserved via chain. |
-| Contradiction | "I love TypeScript" → "I hate TypeScript" | Same as update. Old deactivated. |
+| Update (same key) | "I work at Stripe" → "I just joined Notion" | Old deactivated, new supersedes old. History preserved via chain. |
+| Contradiction (same key) | "I love TypeScript" → "I hate TypeScript" | Same as update. Old deactivated. |
 | Correction | "actually, React Native not React" | Same as update. New value includes correction note. |
 | Nuance | "love TS" → "generics annoying" → "fine for big projects" | Old deactivated, new supersedes. Latest nuance always shown in recall. Full arc visible in `/memories` with timestamps. |
+| Cross-key conflict | New: employer="Joined Stripe" vs Old: title="PM at Notion" | pgvector similarity (> 0.80) detects semantic relation between different keys. LLM classifies: `update` deactivates old title, `merge` combines both values, `independent` keeps both. |
+
+Same-key contradictions compare only against the most recent memory for that key (sorted by `created_at desc`). Cross-key contradictions compare against ALL active memories with different keys, using vector similarity as a pre-filter to avoid O(n²) LLM calls.
 
 The supersession chain is fully inspectable via `GET /users/{user_id}/memories` — each memory has `supersedes` and `superseded_by` fields forming a linked list of updates.
 
 ## Tradeoffs
 
-**Optimized for recall quality, not latency.** Each `/recall` makes 2-3 LLM calls (embedding + reranking). This adds ~500ms but significantly improves relevance over vanilla cosine-top-k.
+**Optimized for recall quality, not latency.** Each `/recall` makes 3-4 LLM calls (query rewriting + embedding + reranking + optional cross-key check). This adds ~600ms but significantly improves relevance, especially for multi-hop queries.
 
 **Synchronous extraction in `/turns`.** No Celery, no Redis queue. The 60-second eval timeout is generous. Synchronous means no race conditions — after `/turns` returns, memories are immediately queryable.
 
-**Single extraction model.** GPT-4o-mini handles extraction, contradiction, and reranking. No fallback to rule-based extraction. If OpenAI is down, extraction fails but turns persist.
+**Single extraction model.** GPT-4o-mini handles extraction, contradiction, query rewriting, and reranking. No fallback to rule-based extraction. If OpenAI is down, extraction fails but turns persist.
 
-**No query rewriting.** Hybrid search (vector + BM25 + reranking) covers both semantic and keyword queries. Query rewriting would add another LLM call for marginal improvement.
+**Query rewriting with cheap gate.** Queries ≤ 4 words skip the rewrite LLM call entirely. Longer queries are decomposed into sub-queries only when the LLM flags `is_multi_hop: true`. Most queries pass through unchanged.
 
 **Embeddings on memories table.** Fewer joins = simpler queries, faster recall. Tradeoff: one embedding per memory (sufficient for atomic facts).
 
-**Search endpoint content format.** `/search` returns results with a single `content` field (`"key: value"`) rather than separate `key`/`value`/`type` fields. This follows conventional search API conventions (one text blob per result) and keeps the response compact. Tradeoff: callers that need structured access must parse the content string, or use `/users/{user_id}/memories` instead, which returns fully structured memory objects with all fields. The `/search` endpoint prioritizes search relevance (hybrid vector + BM25 + RRF) and simplicity; `/memories` prioritizes structured browsing of the full memory graph.
+**Search endpoint.** `/search` now includes LLM reranking (top-10 candidates after RRF fusion) and returns `key` and `type` fields alongside the `content` field. BM25 uses `websearch_to_tsquery` with `plainto_tsquery` fallback for better phrase handling. Callers needing the full structured memory graph should use `/users/{user_id}/memories`.
 
 ## Failure Modes
 
