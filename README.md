@@ -16,10 +16,12 @@ A Dockerized memory service that ingests conversation turns, extracts structured
 │  │                  Services                          │   │
 │  │  ExtractionService  RecallService  SearchService   │   │
 │  │  MemoryService      LLMService     QueryVocab     │   │
+│  │  EntityExpansion (KEY_RELATIONS)                  │   │
 │  │                                                    │   │
 │  │  LLM prompts: extract, contradiction,              │   │
 │  │  cross_key_contradiction, query_rewrite, rerank    │   │
 │  │  Query vocab: 15 hint patterns → key + synonyms   │   │
+│  │  Entity expansion: 18 key groups → related keys   │   │
 │  └───────────────────────┬───────────────────────────┘   │
 │                          │                                │
 │  ┌───────────────────────▼───────────────────────────┐   │
@@ -77,17 +79,18 @@ All Pydantic schemas use `extra="forbid"` — unknown fields in request bodies a
 
 ## Recall Strategy
 
-`POST /recall` runs a 9-stage pipeline (with BM25-only fallback when no API key):
+`POST /recall` runs a 10-stage pipeline (with BM25-only fallback when no API key):
 
 1. **Query rewriting** — LLM decomposes multi-hop queries into 2-3 sub-queries. Simple queries pass through unchanged. Sub-query embeddings batched in one API call. (Skipped without API key.)
 2. **Query hint analysis** — 15 regex patterns map the query to canonical memory keys (location, pet, employer, food_preferences, etc.) and expand with domain-specific synonyms. No LLM needed — runs on every query.
 3. **Vector search** — pgvector HNSW cosine similarity, top-30 candidates per sub-query
 4. **BM25 search** — expanded query (original + hint synonyms) against pre-computed `tsvector` with GIN index, top-30 candidates per sub-query
 5. **Key search** — direct SQL `WHERE key IN (...)` for hint-matched canonical keys, deterministic recall boost (bypasses fuzzy search entirely)
-6. **Reciprocal Rank Fusion** (k=60) — merge vector + BM25 + key results. Key matches get 2x weight (`KEY_MATCH_BOOST`). Same-session memories get a small recency advantage (`SESSION_BOOST_ALPHA=0.05`). Temporal decay favors recent memories.
-7. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking with multi-hop reasoning. Returns grouped memories that jointly answer the query. (Skipped without API key.)
-8. **Noise gating** — three authority tiers: key match (highest authority) > vector similarity > BM25-only. Similarity thresholds filter irrelevant results: 0.25 floor for query-relevant filtering, 0.20 noise floor for reranked results; stable facts skip entirely when no authoritative results survive.
-9. **Context assembly** — format ranked memories into structured text under the token budget, showing only current values (evolution history preserved in stable facts section but excluded from query-relevant results to save tokens)
+6. **Entity expansion** — for multi-hop queries, discovered keys are looked up in `KEY_RELATIONS` to fetch related keys deterministically. Expansion results are appended to key search results before fusion. Only fires when query rewriting produces multiple sub-queries.
+7. **Reciprocal Rank Fusion** (k=60) — merge vector + BM25 + key + expansion results. Key matches get 2x weight (`KEY_MATCH_BOOST`). Same-session memories get a small recency advantage (`SESSION_BOOST_ALPHA=0.05`). Temporal decay favors recent memories.
+8. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking with multi-hop reasoning. Returns grouped memories that jointly answer the query. (Skipped without API key.)
+9. **Noise gating** — three authority tiers: key match (highest authority) > vector similarity > BM25-only. Similarity thresholds filter irrelevant results: 0.25 floor for query-relevant filtering, 0.20 noise floor for reranked results; stable facts skip entirely when no authoritative results survive.
+10. **Context assembly** — format ranked memories into structured text under the token budget, showing only current values (evolution history preserved in stable facts section but excluded from query-relevant results to save tokens)
 
 ### BM25-only Fallback (no API key)
 
@@ -111,13 +114,25 @@ Stable facts are filtered by relevance to the query — only facts with cosine s
 
 ### Multi-hop Recall
 
-For queries like "What city does the user with the dog named Biscuit live in?", the system uses a 3-layer approach:
+For queries like "What city does the user with the dog named Biscuit live in?", the system uses a 4-layer approach:
 
 1. **Query rewriting** — the LLM decomposes the query into ["person has a dog named Biscuit", "where that person lives"]. Each sub-query gets its own embedding + hybrid search.
 2. **Multi-hop reranking** — the reranker prompt explicitly asks which memories, *when combined*, answer the query. It returns `groups` of memories that jointly contribute, with reasoning. Grouped memories are promoted to the top of results.
-3. **Broad recall net** — running multiple sub-queries through both vector and BM25 search casts a wider net, increasing the chance that both the pet fact and location fact surface in the candidate set.
+3. **Entity expansion** — after initial retrieval, all discovered memory keys are looked up in a static relationship map (`KEY_RELATIONS`). Related keys are fetched deterministically via `key_search()`. For example, a query about "the user with the golden retriever" surfaces `pet`-keyed memories; entity expansion then also fetches `location`, `name`, `spouse`, and `child` memories, ensuring the location fact is in the candidate pool before reranking.
 
-No explicit graph traversal — at this scale (single user, hundreds of memories), query decomposition + LLM reranking is sufficient and avoids graph maintenance overhead.
+| Source key | Related keys |
+|------------|-------------|
+| `pet` | location, name, spouse, child |
+| `employer` | occupation, title, location, education |
+| `spouse` | spouse_occupation, location, child |
+| `location` | employer, pet, name, hobby |
+| `education` | employer, occupation |
+| `programming_language` | framework, employer |
+| + 12 more keys | ... |
+
+Entity expansion only fires for multi-hop queries (when `len(sub_queries) > 1`), avoiding unnecessary work on simple single-hop queries.
+
+Entity expansion complements query decomposition by following predefined key relationships (`KEY_RELATIONS`). When a multi-hop query surfaces memories with key `pet`, the system automatically fetches related keys (`location`, `name`, `spouse`, `child`) to ensure all facts needed to answer a multi-hop query are in the candidate set before reranking. This is a lightweight entity graph — static, no maintenance overhead — that bridges the gap between unstructured vector search and structured graph traversal.
 
 ### Session-only Recall
 
@@ -161,6 +176,8 @@ This is a deliberate tradeoff: showing all opinions in recall context would cons
 **Dual-track extraction: rules + LLM.** Rule-based extraction (20 regex patterns, user-only gate, key normalization, correction key inference, occupation stop-words) always runs and works without any API key. LLM extraction adds richer values and broader coverage. LLM wins on key conflict; rules fill gaps when LLM is unavailable or misses a pattern.
 
 **Query rewriting with cheap gate.** Queries ≤ 4 words skip the rewrite LLM call entirely. Longer queries are decomposed into sub-queries only when the LLM flags `is_multi_hop: true`. Most queries pass through unchanged.
+
+**Entity expansion for multi-hop queries.** A static `KEY_RELATIONS` map defines which memory keys are semantically related (e.g., `pet` → `location`). When a multi-hop query is detected, discovered keys trigger expansion to related keys via deterministic SQL lookup — no embedding or LLM cost. This is a lightweight entity graph without graph maintenance overhead. At this scale it's sufficient; for production with thousands of users, a dynamic entity-extraction graph would be needed.
 
 **Query hint vocabulary.** 15 regex patterns map natural-language queries to canonical memory keys and expand with domain synonyms — no LLM needed. "What's their dog's name?" matches the `pet` key and adds "dog", "cat", "animal", "pet name", "breed" to the BM25 query. Key search provides deterministic SQL matching that bypasses fuzzy vector/keyword search entirely. This is the third retrieval signal alongside vector and BM25.
 

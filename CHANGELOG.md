@@ -524,6 +524,50 @@ Updated `tests/conftest.py` with Docker integration fixtures and hermetic test c
 
 ---
 
+## v13 — Entity expansion for multi-hop queries
+
+**What changed:** Added entity expansion to the multi-hop recall pipeline. When a multi-hop query is detected (multiple sub-queries), the system follows predefined key relationships to fetch related memories that may not surface through vector or BM25 search alone.
+
+### Static key relationship map
+
+New `KEY_RELATIONS` dict in `recall_service.py` defines 18 key groups mapping each memory key to its semantically related keys:
+
+| Source key | Related keys | Rationale |
+|------------|-------------|-----------|
+| `pet` | location, name, spouse, child | Pet ownership correlates with household facts |
+| `employer` | occupation, title, location, education | Job changes affect title, location, and reflect education |
+| `spouse` | spouse_occupation, location, child | Spouse facts relate to household and family |
+| `location` | employer, pet, name, hobby | Location anchors many personal facts |
+| `education` | employer, occupation | Education connects to career trajectory |
+| `programming_language` | framework, employer | Tech stack choices cluster together |
+| `dietary_restriction` ↔ `allergy` | each other | Diet and allergies are medically linked |
+| + 11 more key groups | ... | ... |
+
+### Entity expansion algorithm
+
+`_entity_expansion()` runs after initial vector + BM25 + key search:
+
+1. Collect all keys found in vector, BM25, and key search results
+2. For each found key, look up related keys in `KEY_RELATIONS`
+3. Subtract already-found keys (avoid redundant fetches)
+4. Fetch remaining related keys via `MemoryRepo.key_search()`
+5. Append expansion results to `key_results` before RRF fusion
+
+Only fires when `len(sub_queries) > 1` — simple single-hop queries skip expansion entirely.
+
+**Files:** `src/services/recall_service.py`
+
+---
+
+**Why:** Multi-hop queries like "What city does the user with the golden retriever live in?" need both `pet` and `location` facts. Vector search might surface the pet fact but miss the location fact if their embeddings aren't similar enough. Key search only fires for hint-matched keys (the query mentions "golden retriever" → `pet` key, but doesn't mention location words). Entity expansion bridges this gap by following the `pet` → `location` relationship, ensuring the location memory is in the candidate pool for the reranker to connect.
+
+**Result:**
+- Multi-hop queries now reliably surface all related facts, even when the query only explicitly mentions one entity
+- Zero additional LLM/embedding cost — purely deterministic SQL lookup
+- Only activates for multi-hop queries, no overhead on simple queries
+
+---
+
 ## v11 — Extraction prompt tuning, location regex cleanup, recall threshold rebalancing
 
 **What changed:** 4 targeted improvements to extraction accuracy and recall noise gating.
