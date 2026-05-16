@@ -30,7 +30,7 @@ class SearchService:
         if user_id:
             return await self._search_by_user(query, user_id, limit)
 
-        return await self._search_by_session(session_id, limit)
+        return await self._search_by_session(query, session_id, limit)
 
     async def _search_by_user(self, query: str, user_id: str, limit: int) -> list[dict]:
         if not settings.llm_available:
@@ -40,7 +40,7 @@ class SearchService:
             query_embeddings = await llm_service.embed([query])
             query_embedding = query_embeddings[0]
         except Exception as e:
-            logger.warning(f"Query embedding failed for search, falling back to BM25: {e}")
+            logger.warning("Query embedding failed for search, falling back to BM25: %s", e)
             return await self._fallback_search(query, user_id, limit)
 
         expanded_query = expand_query_for_bm25(query)
@@ -54,10 +54,10 @@ class SearchService:
         )
 
         if isinstance(vector_results, Exception):
-            logger.warning(f"Vector search failed: {vector_results}")
+            logger.warning("Vector search failed: %s", vector_results)
             vector_results = []
         if isinstance(bm25_results, Exception):
-            logger.warning(f"BM25 search failed: {bm25_results}")
+            logger.warning("BM25 search failed: %s", bm25_results)
             bm25_results = []
 
         key_results = []
@@ -96,7 +96,7 @@ class SearchService:
             result = await llm_service.rerank(query, memories_for_rerank)
             ranked_indices = result["ranked_indices"]
         except Exception as e:
-            logger.warning(f"Search rerank failed, using RRF order: {e}")
+            logger.warning("Search rerank failed, using RRF order: %s", e)
             return candidates
 
         reranked = []
@@ -114,14 +114,47 @@ class SearchService:
 
         return reranked
 
-    async def _search_by_session(self, session_id: str, limit: int) -> list[dict]:
+    async def _search_by_session(self, query: str, session_id: str, limit: int) -> list[dict]:
         memories = await self.memory_repo.get_by_session(session_id)
-        active = [m for m in memories if m.active][:limit]
-        results = []
+        active = [m for m in memories if m.active]
+
+        if not query or not active:
+            return [
+                {
+                    "content": f"{m.key}: {m.value}",
+                    "score": m.confidence,
+                    "session_id": m.source_session,
+                    "timestamp": m.created_at.isoformat() if m.created_at else "",
+                    "metadata": {"key": m.key, "type": m.type},
+                }
+                for m in active[:limit]
+            ]
+
+        # Keyword filtering within session scope
+        query_lower = query.lower()
+        query_terms = set(query_lower.split())
+        scored = []
         for m in active:
+            text = f"{m.key} {m.value}".lower()
+            term_matches = sum(1 for t in query_terms if t in text)
+            # Boost if hint vocabulary matches the memory key
+            hints = analyze_query(query)
+            key_bonus = 1.0
+            if hints["hint_keys"] and m.key in hints["hint_keys"]:
+                key_bonus = 2.0
+                term_matches += 2
+            if term_matches > 0:
+                scored.append((m, term_matches * key_bonus))
+            elif m.confidence >= 0.9:
+                # High-confidence memories get a small base score
+                scored.append((m, 0.1))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        results = []
+        for m, score in scored[:limit]:
             results.append({
                 "content": f"{m.key}: {m.value}",
-                "score": m.confidence,
+                "score": round(min(score / max(len(query_terms), 1), 1.0), 4),
                 "session_id": m.source_session,
                 "timestamp": m.created_at.isoformat() if m.created_at else "",
                 "metadata": {"key": m.key, "type": m.type},

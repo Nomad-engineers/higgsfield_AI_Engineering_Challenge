@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     @property
     def llm_available(self) -> bool:
-        return bool(self.OPENAI_API_KEY and self.OPENAI_API_KEY.startswith("sk-"))
+        return bool(self.OPENAI_API_KEY) or bool(self.OPENAI_BASE_URL)
 
 
 settings = Settings()

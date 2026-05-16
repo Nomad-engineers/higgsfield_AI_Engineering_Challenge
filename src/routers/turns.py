@@ -39,7 +39,7 @@ async def create_turn(body: TurnCreate, db: AsyncSession = Depends(get_db)):
             )
             await db.commit()
         except Exception as e:
-            logger.warning(f"Extraction failed for turn {turn_id}: {e}")
+            logger.warning("Extraction failed for turn %s: %s", turn_id, e)
             await db.rollback()
 
     return TurnResponse(id=str(turn_id))

@@ -130,16 +130,16 @@ def format_stable_facts(memories: list, budget_tokens: int, superseded_chains: d
 
     grouped = _group_by_key(memories)
     lines = []
-    used = 0
-    budget_chars = budget_tokens * 3
+    used_tokens = 0
     compact = budget_tokens < 256
 
     for key, mems in grouped.items():
         line = _render_evolution_arc(key, mems, compact, superseded_chains)
-        if used + len(line) + 1 > budget_chars:
+        line_tokens = estimate_tokens(line)
+        if used_tokens + line_tokens + 1 > budget_tokens:
             break
         lines.append(line)
-        used += len(line) + 1
+        used_tokens += line_tokens + 1
 
     if not lines:
         return ""
@@ -156,8 +156,7 @@ def format_relevant_memories(
 
     lines = []
     citations = []
-    used = 0
-    budget_chars = budget_tokens * 3
+    used_tokens = 0
     seen_keys: dict[str, list] = defaultdict(list)
     compact = budget_tokens < 256
 
@@ -171,10 +170,11 @@ def format_relevant_memories(
                 line = f"[{memory.type}/{memory.key}] {memory.value}"
             else:
                 line = f"- [{memory.type}/{memory.key}] {memory.value}"
-            if used + len(line) + 1 > budget_chars:
+            line_tokens = estimate_tokens(line)
+            if used_tokens + line_tokens + 1 > budget_tokens:
                 break
             lines.append(line)
-            used += len(line) + 1
+            used_tokens += line_tokens + 1
             citations.append({
                 "turn_id": str(memory.source_turn_id) if memory.source_turn_id else None,
                 "score": round(score, 4),
@@ -186,10 +186,11 @@ def format_relevant_memories(
                 line = f"[{newest_mem.type}/{key}] {newest_mem.value}"
             else:
                 line = f"- [{newest_mem.type}/{key}] {newest_mem.value}"
-            if used + len(line) + 1 > budget_chars:
+            line_tokens = estimate_tokens(line)
+            if used_tokens + line_tokens + 1 > budget_tokens:
                 break
             lines.append(line)
-            used += len(line) + 1
+            used_tokens += line_tokens + 1
             for memory, score in items:
                 citations.append({
                     "turn_id": str(memory.source_turn_id) if memory.source_turn_id else None,
@@ -206,18 +207,18 @@ def format_relevant_memories(
 
 def format_recent_turns(turns: list, budget_tokens: int) -> str:
     lines = []
-    used = 0
-    budget_chars = budget_tokens * 3
+    used_tokens = 0
 
     for turn in reversed(turns):
         for msg in turn.messages:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
             line = f"{role}: {content}"
-            if used + len(line) + 1 > budget_chars:
+            line_tokens = estimate_tokens(line)
+            if used_tokens + line_tokens + 1 > budget_tokens:
                 break
             lines.append(line)
-            used += len(line) + 1
+            used_tokens += line_tokens + 1
 
     if not lines:
         return ""
@@ -260,13 +261,13 @@ class RecallService:
         # Temporal constraint extraction
         temporal_constraint = parse_temporal(query)
         if temporal_constraint:
-            logger.info(f"Temporal constraint detected: after={temporal_constraint.get('after')}, before={temporal_constraint.get('before')}")
+            logger.info("Temporal constraint detected: after=%s, before=%s", temporal_constraint.get('after'), temporal_constraint.get('before'))
 
         # Embed all sub-queries in one batch
         try:
             all_embeddings = await llm_service.embed(sub_queries)
         except Exception as e:
-            logger.warning(f"Query embedding failed, falling back to BM25: {e}")
+            logger.warning("Query embedding failed, falling back to BM25: %s", e)
             return await self._bm25_fallback_recall(query, user_id, max_tokens, session_id=session_id)
 
         # Run hybrid search for each sub-query and merge results
@@ -297,11 +298,11 @@ class RecallService:
             )
             if expansion:
                 key_results = key_results + expansion
-                logger.info(f"Entity expansion added {len(expansion)} memories for multi-hop")
+                logger.info("Entity expansion added %d memories for multi-hop", len(expansion))
 
         fused = rrf_merge(all_vector_results, all_bm25_results, key_results, session_id=session_id, temporal_constraint=temporal_constraint)
         if not fused:
-            logger.info(f"Recall: no fused results (vec={len(all_vector_results)} bm25={len(all_bm25_results)} key={len(key_results)}), query='{query[:50]}'")
+            logger.info("Recall: no fused results (vec=%d bm25=%d key=%d), query='%s'", len(all_vector_results), len(all_bm25_results), len(key_results), query[:50])
             return await self._bm25_fallback_recall(query, user_id, max_tokens, session_id=session_id)
 
         reranked = await self._rerank(query, fused, sub_queries)
@@ -321,7 +322,7 @@ class RecallService:
         try:
             result = await llm_service.rewrite_query(query)
         except Exception as e:
-            logger.warning(f"Query rewrite failed, using original: {e}")
+            logger.warning("Query rewrite failed, using original: %s", e)
             return [query]
 
         if not result.get("is_multi_hop", False):
@@ -332,7 +333,8 @@ class RecallService:
             return [query]
 
         logger.info(
-            f"Query rewritten: '{query[:60]}' -> {len(sub_queries)} sub-queries"
+            "Query rewritten: '%s' -> %d sub-queries",
+            query[:60], len(sub_queries),
         )
         return sub_queries
 
@@ -347,10 +349,10 @@ class RecallService:
         )
 
         if isinstance(vector_results, Exception):
-            logger.warning(f"Vector search failed: {vector_results}")
+            logger.warning("Vector search failed: %s", vector_results)
             vector_results = []
         if isinstance(bm25_results, Exception):
-            logger.warning(f"BM25 search failed: {bm25_results}")
+            logger.warning("BM25 search failed: %s", bm25_results)
             bm25_results = []
 
         return vector_results, bm25_results
@@ -381,7 +383,7 @@ class RecallService:
         if not related_keys:
             return []
 
-        logger.info(f"Entity expansion (dynamic): {found_keys} -> {related_keys}")
+        logger.info("Entity expansion (dynamic): %s -> %s", found_keys, related_keys)
         return await self.memory_repo.key_search(user_id, list(related_keys), limit=10)
 
     async def _rerank(
@@ -399,7 +401,7 @@ class RecallService:
         try:
             result = await llm_service.rerank(query, memories_for_rerank, sub_queries)
         except Exception as e:
-            logger.warning(f"LLM rerank failed, using RRF order: {e}")
+            logger.warning("LLM rerank failed, using RRF order: %s", e)
             return top_k
 
         ranked_indices = result["ranked_indices"]
@@ -496,7 +498,8 @@ class RecallService:
                 ]
 
         logger.info(
-            f"Recall gate: reranked={len(reranked)}, max_sim={max_sim:.3f}"
+            "Recall gate: reranked=%d, max_sim=%.3f",
+            len(reranked), max_sim,
         )
 
         # Phase 1: Stable facts — show user profile when query-relevant results exist
@@ -555,9 +558,11 @@ class RecallService:
 
         context = "\n\n".join(s for s in sections if s)
 
-        max_chars = int(max_tokens * 3 * 1.2)
-        if len(context) > max_chars:
-            context = context[:max_chars] + "..."
+        if estimate_tokens(context) > max_tokens:
+            # Hard truncate to stay within budget
+            while estimate_tokens(context) > max_tokens and len(context) > 50:
+                context = context[:len(context) * max_tokens // estimate_tokens(context)]
+            context = context.rstrip() + "..."
 
         return context, citations
 
@@ -615,9 +620,10 @@ class RecallService:
 
         context = "\n\n".join(s for s in sections if s)
 
-        max_chars = int(max_tokens * 3 * 1.2)
-        if len(context) > max_chars:
-            context = context[:max_chars] + "..."
+        if estimate_tokens(context) > max_tokens:
+            while estimate_tokens(context) > max_tokens and len(context) > 50:
+                context = context[:len(context) * max_tokens // estimate_tokens(context)]
+            context = context.rstrip() + "..."
 
         return context, citations
 

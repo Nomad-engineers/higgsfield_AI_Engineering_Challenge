@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,7 +50,7 @@ class ExtractionService:
             try:
                 llm_memories = await llm_service.extract_memories(messages)
             except Exception as e:
-                logger.warning(f"LLM extraction failed: {e}")
+                logger.warning("LLM extraction failed: %s", e)
 
         raw_memories = self._merge_extractions(rule_memories, llm_memories)
 
@@ -150,7 +151,7 @@ class ExtractionService:
         turn_index: int | None = None,
         provenance: str | None = None,
     ) -> object | None:
-        existing = await self.memory_repo.get_active_by_key(user_id, key, for_update=False)
+        existing = await self.memory_repo.get_active_by_key(user_id, key)
 
         if not existing:
             memory = await self.memory_repo.create(
@@ -165,10 +166,11 @@ class ExtractionService:
                 turn_index=turn_index,
                 provenance=provenance,
             )
-            logger.info(f"New memory: {key}={value[:80]}")
+            logger.info("New memory: %s=%s", key, value[:80])
             return memory
 
         old_mem = existing[0]
+        old_updated_at = old_mem.updated_at
         best_relationship = "new"
         best_match = old_mem
 
@@ -178,13 +180,37 @@ class ExtractionService:
             )
             best_relationship = result.get("relationship", "new")
             logger.info(
-                f"Contradiction check: {key} -> {best_relationship} "
-                f"({result.get('reason', '')[:60]})"
+                "Contradiction check: %s -> %s (%s)",
+                key, best_relationship, result.get('reason', '')[:60],
             )
         except Exception as e:
-            logger.warning(f"Contradiction check failed: {e}")
+            logger.warning("Contradiction check failed: %s", e)
 
         if best_relationship == "new":
+            # Optimistic lock: re-read to ensure no concurrent writer changed it
+            fresh = await self.memory_repo.get_active_by_key(user_id, key, for_update=True)
+            if fresh and fresh[0].updated_at == old_updated_at:
+                memory = await self.memory_repo.create(
+                    user_id=user_id,
+                    type=type_,
+                    key=key,
+                    value=value,
+                    confidence=confidence,
+                    source_session=session_id,
+                    source_turn_id=turn_id,
+                    extraction_method=extraction_method,
+                    turn_index=turn_index,
+                    provenance=provenance,
+                )
+                logger.info("New memory (existing key but unrelated): %s=%s", key, value[:80])
+                return memory
+            logger.info("Concurrent write detected for key=%s, skipping duplicate", key)
+            return None
+
+        # Optimistic lock for supersession
+        fresh = await self.memory_repo.get_active_by_key(user_id, key, for_update=True)
+        if not fresh:
+            logger.info("Memory key=%s was deactivated by concurrent writer, creating fresh", key)
             memory = await self.memory_repo.create(
                 user_id=user_id,
                 type=type_,
@@ -197,12 +223,12 @@ class ExtractionService:
                 turn_index=turn_index,
                 provenance=provenance,
             )
-            logger.info(f"New memory (existing key but unrelated): {key}={value[:80]}")
             return memory
 
-        await self.memory_repo.deactivate_by_id(best_match.id)
+        target = fresh[0]
+        await self.memory_repo.deactivate_by_id(target.id)
         confidence = (
-            min(1.0, max(confidence, best_match.confidence) + 0.05)
+            min(1.0, max(confidence, target.confidence) + 0.05)
             if best_relationship == "nuance"
             else confidence
         )
@@ -214,14 +240,14 @@ class ExtractionService:
             confidence=confidence,
             source_session=session_id,
             source_turn_id=turn_id,
-            supersedes=best_match.id,
+            supersedes=target.id,
             extraction_method=extraction_method,
             turn_index=turn_index,
             provenance=provenance,
         )
         logger.info(
-            f"{best_relationship.title()}: {key} "
-            f"'{best_match.value[:40]}' -> '{value[:40]}'"
+            "%s: %s '%s' -> '%s'",
+            best_relationship.title(), key, target.value[:40], value[:40],
         )
         return memory
 
@@ -272,7 +298,7 @@ class ExtractionService:
                         old_type=old_mem.type,
                     )
                 except Exception as e:
-                    logger.warning(f"Cross-key contradiction check failed: {e}")
+                    logger.warning("Cross-key contradiction check failed: %s", e)
                     continue
 
                 action = result.get("action", "keep_both")
@@ -292,6 +318,7 @@ class ExtractionService:
                 elif action == "merge":
                     await self.memory_repo.deactivate_by_id(old_mem.id)
                     new_mem.value = f"{new_mem.value}; previously {old_mem.value}"
+                    new_mem.updated_at = datetime.now(timezone.utc)
                     re_embed_needed.append(new_mem)
                     logger.info(
                         f"Cross-key merge: {new_mem.key} absorbed {old_mem.key}"
@@ -304,7 +331,7 @@ class ExtractionService:
         try:
             embeddings = await llm_service.embed(texts)
         except Exception as e:
-            logger.warning(f"Embedding failed: {e}")
+            logger.warning("Embedding failed: %s", e)
             return
 
         for memory, embedding in zip(memories, embeddings):

@@ -166,6 +166,37 @@ PATTERNS = [
         "preference",
         "preference",
     ),
+    # --- Travel ---
+    (
+        re.compile(
+            r"(?i)\b(?:we\s+)?(?:went|traveled|visited|flew)\s+(?:to\s+)?([A-Z][a-zA-Z\s]+?)(?:\s+(?:last|this|and|for|but|on)\b|\.|,|!|$)"
+        ),
+        "travel",
+        "event",
+    ),
+    # --- Birthday ---
+    (
+        re.compile(
+            r"(?i)\b(?:my\s+)?birthday\s+(?:is\s+)?(?:coming up\s+)?(?:on\s+)?([A-Za-z]+\s+\d+(?:st|nd|rd|th)?)"
+        ),
+        "birthday",
+        "fact",
+    ),
+    (
+        re.compile(
+            r"(?i)\bI(?:'ll| will)\s+be\s+(\d+)\s+(?:years?\s+old)?"
+        ),
+        "age",
+        "fact",
+    ),
+    # --- Spouse ---
+    (
+        re.compile(
+            r"(?i)\bmy\s+(?:husband|wife|spouse|partner)\s+(?:is\s+)?(?:named\s+)?(\w+)"
+        ),
+        "spouse",
+        "fact",
+    ),
     # --- Name ---
     (
         re.compile(
@@ -258,5 +289,5 @@ class RuleExtractor:
                     })
 
         if results:
-            logger.info(f"Rule-based extraction found {len(results)} memories")
+            logger.info("Rule-based extraction found %d memories", len(results))
         return results

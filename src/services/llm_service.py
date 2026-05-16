@@ -32,7 +32,7 @@ class LLMService:
             resp = await self.client.post(url, json=payload)
             if resp.status_code == 429 and attempt < MAX_RETRIES - 1:
                 wait = min(2 ** (attempt + 1), 10)
-                logger.warning(f"Rate limited, retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                logger.warning("Rate limited, retrying in %ds (attempt %d/%d)", wait, attempt + 1, MAX_RETRIES)
                 await asyncio.sleep(wait)
                 continue
             resp.raise_for_status()
