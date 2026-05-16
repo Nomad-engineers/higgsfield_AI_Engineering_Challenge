@@ -139,6 +139,55 @@ def test_recall_empty_for_unknown_user(client):
     assert body["citations"] == []
 
 
+def test_fact_evolution_employer_is_current(client):
+    """Recall should return the LATEST employer (Stripe), not the old one (Notion)."""
+    resp = client.post("/recall", json={
+        "query": "What does this user do for work?",
+        "session_id": "fact-evo-session",
+        "user_id": "alice",
+        "max_tokens": 512,
+    })
+    assert resp.status_code == 200
+    context = resp.json()["context"].lower()
+
+    assert "stripe" in context, (
+        "Expected current employer 'Stripe' in recall context"
+    )
+    assert "notion" not in context, (
+        "Old employer 'Notion' should NOT appear — it was superseded by Stripe"
+    )
+
+
+def test_fact_evolution_history_preserved(client):
+    """The /memories endpoint should show the superseded Notion memory with correct metadata."""
+    resp = client.get("/users/alice/memories")
+    assert resp.status_code == 200
+    memories = resp.json()["memories"]
+
+    notion_mem = None
+    stripe_mem = None
+    for m in memories:
+        val = m["value"].lower()
+        if "notion" in val and m["key"] == "employer":
+            notion_mem = m
+        if "stripe" in val and m["key"] == "employer":
+            stripe_mem = m
+
+    assert stripe_mem is not None, "Expected a Stripe employer memory to exist"
+    assert stripe_mem["active"] is True, "Stripe memory should be active"
+
+    assert notion_mem is not None, "Expected a Notion employer memory to exist"
+    assert notion_mem["active"] is False, (
+        "Notion memory should be inactive — superseded by Stripe"
+    )
+    assert notion_mem["superseded_by"] is not None, (
+        "Notion memory should have superseded_by set"
+    )
+    assert notion_mem["superseded_by"] == stripe_mem["id"], (
+        "Notion's superseded_by should point to the Stripe memory"
+    )
+
+
 def test_noise_resistance_unrelated_query(client, fixtures):
     """Unrelated query should not dump entire user profile."""
     resp = client.post("/recall", json={
@@ -156,3 +205,22 @@ def test_noise_resistance_unrelated_query(client, fixtures):
     assert not leaked, (
         f"Noise leak: unrelated facts {leaked} found in context for car query"
     )
+
+
+def test_noise_resistance_context_is_minimal_for_unrelated(client):
+    """An unrelated query should return empty or very short context."""
+    resp = client.post("/recall", json={
+        "query": "quantum physics equations",
+        "session_id": "noise-physics-session",
+        "user_id": "alice",
+        "max_tokens": 512,
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    context = body["context"]
+
+    if context:
+        assert len(context) < 300, (
+            f"Noise: unrelated query returned {len(context)} chars of context, "
+            f"expected < 300. Context: {context[:200]}"
+        )

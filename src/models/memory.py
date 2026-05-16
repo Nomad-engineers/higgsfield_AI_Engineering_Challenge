@@ -2,8 +2,8 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, Column, Float, ForeignKey, Index, String, Text
-from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
+from sqlalchemy import Boolean, Column, Computed, Float, ForeignKey, Index, String, Text
+from sqlalchemy.dialects.postgresql import TIMESTAMP, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.turn import Base
@@ -25,6 +25,11 @@ class Memory(Base):
     supersedes: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     embedding = mapped_column(Vector(1536), nullable=True)
+    search_vector = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', coalesce(key, '') || ' ' || coalesce(value, ''))", persisted=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default="NOW()"
     )
@@ -38,4 +43,5 @@ class Memory(Base):
               postgresql_ops={"embedding": "vector_cosine_ops"}),
         Index("idx_memories_user_active", "user_id", "active"),
         Index("idx_memories_key", "user_id", "key", postgresql_where="active = true"),
+        Index("idx_memories_search", "search_vector", postgresql_using="gin"),
     )

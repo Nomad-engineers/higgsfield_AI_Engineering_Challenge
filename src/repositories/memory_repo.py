@@ -157,13 +157,13 @@ class MemoryRepo:
             SELECT id, user_id, type, key, value, confidence, source_session,
                    source_turn_id, supersedes, active, created_at, updated_at,
                    ts_rank_cd(
-                       to_tsvector('english', key || ' ' || value),
+                       search_vector,
                        plainto_tsquery('english', :query)
                    ) AS bm25_score
             FROM memories
             WHERE user_id = :user_id
               AND active = TRUE
-              AND to_tsvector('english', key || ' ' || value) @@ plainto_tsquery('english', :query)
+              AND search_vector @@ plainto_tsquery('english', :query)
             ORDER BY bm25_score DESC
             LIMIT :limit
         """)

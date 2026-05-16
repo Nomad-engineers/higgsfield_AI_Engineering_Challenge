@@ -114,16 +114,17 @@ And update extraction formatting to include tool names.
 
 ---
 
-### Task 2.2 — Add fact evolution test
+### Task 2.2 — Add fact evolution test ✅ DONE
 **Priority:** HIGH (eval coverage)
 **Time:** 30 min
 **Agent:** AI Engineer
 **Files:** `tests/recall_quality/test_recall_fixture.py`
 
-**Fix:** Add tests:
-1. `test_fact_evolution_not_current_employer` — `/recall` returns Stripe (new), NOT Notion (old)
-2. `test_fact_evolution_history_preserved` — `/users/{user_id}/memories` shows Notion as superseded
-3. `test_noise_resistance` — unrelated query returns empty or minimal context
+**Done:** Added 4 tests:
+1. `test_fact_evolution_employer_is_current` — recall returns Stripe, NOT Notion
+2. `test_fact_evolution_history_preserved` — /memories shows Notion as superseded with correct superseded_by chain
+3. `test_noise_resistance_unrelated_query` — existing, preserved
+4. `test_noise_resistance_context_is_minimal_for_unrelated` — unrelated query returns empty or <300 chars
 
 ---
 

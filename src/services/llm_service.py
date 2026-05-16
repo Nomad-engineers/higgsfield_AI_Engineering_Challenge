@@ -8,7 +8,7 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 5
+MAX_RETRIES = 3
 
 
 class LLMService:
@@ -29,7 +29,7 @@ class LLMService:
         for attempt in range(MAX_RETRIES):
             resp = await self.client.post(url, json=payload)
             if resp.status_code == 429 and attempt < MAX_RETRIES - 1:
-                wait = 2 ** (attempt + 1)
+                wait = min(2 ** (attempt + 1), 10)
                 logger.warning(f"Rate limited, retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
                 await asyncio.sleep(wait)
                 continue
@@ -120,7 +120,10 @@ class LLMService:
         )
         content = data["choices"][0]["message"]["content"]
         parsed = json.loads(content)
-        return [idx - 1 for idx in parsed.get("ranked_indices", [])]
+        indices = parsed.get("ranked_indices", [])
+        if indices and min(indices) == 0:
+            return indices
+        return [idx - 1 for idx in indices]
 
     async def check_contradiction(
         self, key: str, old_value: str, new_value: str

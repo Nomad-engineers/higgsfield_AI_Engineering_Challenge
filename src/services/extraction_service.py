@@ -156,6 +156,7 @@ class ExtractionService:
             return memory
 
         if best_relationship == "nuance":
+            await self.memory_repo.deactivate_by_id(best_match.id)
             memory = await self.memory_repo.create(
                 user_id=user_id,
                 type=type_,

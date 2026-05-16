@@ -17,7 +17,7 @@ RECALL_RELEVANCE_THRESHOLD = 0.25
 
 
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    return max(1, len(text) // 3)
 
 
 def rrf_merge(

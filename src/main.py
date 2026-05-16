@@ -25,6 +25,18 @@ async def _init_schema():
             __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector")
         )
         await conn.run_sync(_create_tables)
+        # Add search_vector column + GIN index if not yet present (existing DBs)
+        await conn.execute(__import__("sqlalchemy").text(
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS search_vector tsvector"
+        ))
+        await conn.execute(__import__("sqlalchemy").text(
+            "CREATE INDEX IF NOT EXISTS idx_memories_search ON memories USING gin (search_vector)"
+        ))
+        # Backfill: populate search_vector for existing rows
+        await conn.execute(__import__("sqlalchemy").text(
+            "UPDATE memories SET search_vector = to_tsvector('english', coalesce(key, '') || ' ' || coalesce(value, '')) "
+            "WHERE search_vector IS NULL"
+        ))
 
     logger.info("Database schema initialized")
 
