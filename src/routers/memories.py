@@ -11,7 +11,15 @@ router = APIRouter()
 @router.get("/users/{user_id}/memories", response_model=MemoryListResponse)
 async def get_user_memories(user_id: str, db: AsyncSession = Depends(get_db)):
     service = MemoryService(db)
-    memories = await service.get_user_memories(user_id)
+    memories = await service.get_user_memories_with_history(user_id)
+
+    superseded_by_map: dict[str, str] = {}
+    for m in memories:
+        if m.supersedes and not m.active:
+            pass
+        if m.supersedes:
+            superseded_by_map[str(m.supersedes)] = str(m.id)
+
     items = [
         MemoryOut(
             id=str(m.id),
@@ -22,6 +30,7 @@ async def get_user_memories(user_id: str, db: AsyncSession = Depends(get_db)):
             active=m.active,
             source_session=m.source_session,
             supersedes=str(m.supersedes) if m.supersedes else None,
+            superseded_by=superseded_by_map.get(str(m.id)),
             created_at=m.created_at.isoformat() if m.created_at else "",
             updated_at=m.updated_at.isoformat() if m.updated_at else "",
         )

@@ -1,0 +1,213 @@
+{
+  "conversations": [
+    {
+      "session_id": "session-1",
+      "user_id": "alice",
+      "turns": [
+        {
+          "messages": [
+            {"role": "user", "content": "Hi! I just moved to Berlin from NYC last month"},
+            {"role": "assistant", "content": "How's Berlin treating you?"}
+          ],
+          "timestamp": "2025-03-15T10:00:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "It's great! I started a new job at Notion as a PM"},
+            {"role": "assistant", "content": "Congratulations on the new role!"}
+          ],
+          "timestamp": "2025-03-15T10:02:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "I have a golden retriever named Biscuit, she's 3 years old"},
+            {"role": "assistant", "content": "Biscuit sounds adorable! How is she adjusting to the new city?"}
+          ],
+          "timestamp": "2025-03-15T10:05:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "She loves it! By the way, I'm allergic to shellfish so I have to be careful with the food here"},
+            {"role": "assistant", "content": "Good to know! German cuisine has plenty of non-seafood options."}
+          ],
+          "timestamp": "2025-03-15T10:08:00Z"
+        }
+      ]
+    },
+    {
+      "session_id": "session-2",
+      "user_id": "alice",
+      "turns": [
+        {
+          "messages": [
+            {"role": "user", "content": "I love Python for backend work but honestly TypeScript is fine for big projects"},
+            {"role": "assistant", "content": "That's a pragmatic take! What are you working on these days?"}
+          ],
+          "timestamp": "2025-03-16T14:00:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "Working on a side project using React Native. Actually I meant React Native, not React — it's a mobile app"},
+            {"role": "assistant", "content": "React Native is a great choice for cross-platform mobile!"}
+          ],
+          "timestamp": "2025-03-16T14:05:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "Yeah! It's a recipe sharing app. I'm a vegetarian too so I want to focus on plant-based recipes"},
+            {"role": "assistant", "content": "That sounds like a perfect niche!"}
+          ],
+          "timestamp": "2025-03-16T14:10:00Z"
+        }
+      ]
+    },
+    {
+      "session_id": "session-3",
+      "user_id": "alice",
+      "turns": [
+        {
+          "messages": [
+            {"role": "user", "content": "TypeScript generics are getting really annoying on this project"},
+            {"role": "assistant", "content": "Yeah, complex generics can be tricky. What's the specific issue?"}
+          ],
+          "timestamp": "2025-03-18T09:00:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "I think TypeScript is fine for big projects but I'd use Python for scripts and small stuff"},
+            {"role": "assistant", "content": "Makes sense to use the right tool for the job."}
+          ],
+          "timestamp": "2025-03-18T09:10:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "Big news — I just joined Stripe! Leaving Notion after all. Starting Monday as a senior PM"},
+            {"role": "assistant", "content": "Wow, congrats on the Stripe offer! Big move!"}
+          ],
+          "timestamp": "2025-03-18T09:15:00Z"
+        }
+      ]
+    },
+    {
+      "session_id": "session-4",
+      "user_id": "alice",
+      "turns": [
+        {
+          "messages": [
+            {"role": "user", "content": "My birthday is coming up on April 5th! I'll be 28"},
+            {"role": "assistant", "content": "Happy early birthday! Any plans?"}
+          ],
+          "timestamp": "2025-03-20T16:00:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "We went to Japan last summer and it was amazing. Best trip ever. I want to go back for my birthday but flights are too expensive"},
+            {"role": "assistant", "content": "Japan is incredible! Maybe a local celebration this year?"}
+          ],
+          "timestamp": "2025-03-20T16:05:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "Yeah probably just dinner with my husband Carlos. He's a teacher at Berlin International School"},
+            {"role": "assistant", "content": "A nice dinner sounds perfect! Carlos sounds supportive."}
+          ],
+          "timestamp": "2025-03-20T16:10:00Z"
+        }
+      ]
+    },
+    {
+      "session_id": "session-5",
+      "user_id": "bob",
+      "turns": [
+        {
+          "messages": [
+            {"role": "user", "content": "I'm Bob, I live in Tokyo and I work as a data engineer at Sony"},
+            {"role": "assistant", "content": "Nice to meet you Bob! How's Tokyo?"}
+          ],
+          "timestamp": "2025-03-15T11:00:00Z"
+        },
+        {
+          "messages": [
+            {"role": "user", "content": "I have two cats — Mochi and Soba. Mochi is orange and Soba is gray"},
+            {"role": "assistant", "content": "Cute names! Do they get along?"}
+          ],
+          "timestamp": "2025-03-15T11:05:00Z"
+        }
+      ]
+    }
+  ],
+  "probe_queries": [
+    {
+      "query": "Where does this user live?",
+      "user_id": "alice",
+      "expected_facts": ["Berlin"],
+      "max_tokens": 512
+    },
+    {
+      "query": "What does this user do for work?",
+      "user_id": "alice",
+      "expected_facts": ["Stripe", "PM"],
+      "max_tokens": 512
+    },
+    {
+      "query": "Does this user have any pets?",
+      "user_id": "alice",
+      "expected_facts": ["Biscuit", "golden retriever"],
+      "max_tokens": 512
+    },
+    {
+      "query": "What programming languages or frameworks does this user prefer?",
+      "user_id": "alice",
+      "expected_facts": ["Python", "TypeScript"],
+      "max_tokens": 512
+    },
+    {
+      "query": "What framework is the user's mobile app built with?",
+      "user_id": "alice",
+      "expected_facts": ["React Native"],
+      "max_tokens": 512
+    },
+    {
+      "query": "What food preferences or dietary restrictions does this user have?",
+      "user_id": "alice",
+      "expected_facts": ["vegetarian", "shellfish"],
+      "max_tokens": 512
+    },
+    {
+      "query": "What is the user's spouse's name and occupation?",
+      "user_id": "alice",
+      "expected_facts": ["Carlos"],
+      "max_tokens": 512
+    },
+    {
+      "query": "Where did the user travel recently?",
+      "user_id": "alice",
+      "expected_facts": ["Japan"],
+      "max_tokens": 512
+    },
+    {
+      "query": "What city does the user with the golden retriever live in?",
+      "user_id": "alice",
+      "expected_facts": ["Berlin"],
+      "max_tokens": 512
+    },
+    {
+      "query": "When is the user's birthday?",
+      "user_id": "alice",
+      "expected_facts": ["April 5"],
+      "max_tokens": 512
+    },
+    {
+      "query": "Where does Bob live and what does he do?",
+      "user_id": "bob",
+      "expected_facts": ["Tokyo", "Sony"],
+      "max_tokens": 512
+    },
+    {
+      "query": "What are Bob's pets' names?",
+      "user_id": "bob",
+      "expected_facts": ["Mochi", "Soba"],
+      "max_tokens": 512
+    }
+  ]
+}

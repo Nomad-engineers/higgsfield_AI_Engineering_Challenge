@@ -2,18 +2,17 @@ from pydantic import BaseModel
 
 
 class SearchResult(BaseModel):
-    id: str
-    type: str
-    key: str
-    value: str
-    confidence: float
-    source_session: str
-    created_at: str
+    content: str
+    score: float
+    session_id: str
+    timestamp: str
+    metadata: dict = {}
 
 
 class SearchRequest(BaseModel):
     query: str
-    user_id: str
+    session_id: str | None = None
+    user_id: str | None = None
     limit: int = 10
 
 

@@ -10,6 +10,7 @@ class MemoryOut(BaseModel):
     active: bool
     source_session: str
     supersedes: str | None = None
+    superseded_by: str | None = None
     created_at: str
     updated_at: str
 

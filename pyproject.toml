@@ -15,6 +15,12 @@ dependencies = [
     "openai>=1.30.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
 [build-system]
 requires = ["setuptools>=70.0"]
 build-backend = "setuptools.build_meta"

@@ -14,6 +14,7 @@ async def search(body: SearchRequest, db: AsyncSession = Depends(get_db)):
     raw_results = await service.search(
         query=body.query,
         user_id=body.user_id,
+        session_id=body.session_id,
         limit=body.limit,
     )
     results = [SearchResult(**r) for r in raw_results]

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Message(BaseModel):
@@ -9,7 +9,7 @@ class Message(BaseModel):
 class TurnCreate(BaseModel):
     session_id: str
     user_id: str | None = None
-    messages: list[Message]
+    messages: list[Message] = Field(..., min_length=1)
     timestamp: str
     metadata: dict | None = None
 
