@@ -1,11 +1,12 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    role: str
+    role: Literal["user", "assistant", "tool"]
     content: str
     name: str | None = None
 

@@ -27,9 +27,9 @@ form complete answers and must be ranked highest.
 
 ## Output format
 
-- "ranked_indices": All item indices (1-based) ordered by relevance.
+- "ranked_indices": All item indices (0-based) ordered by relevance.
 - "groups": For multi-hop queries, list each group of memories that jointly \
-answer the query. Each group has "indices" (1-based) and "reasoning" explaining \
+answer the query. Each group has "indices" (0-based) and "reasoning" explaining \
 how they connect. If the query is simple (single-hop), return an empty groups list.
 """
 

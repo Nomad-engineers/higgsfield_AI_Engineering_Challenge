@@ -91,7 +91,7 @@ class LLMService:
             return {"ranked_indices": [], "groups": []}
 
         numbered = "\n".join(
-            f'{i+1}. "{m["value"]}" [{m["type"]}, key={m["key"]}]'
+            f'{i}. "{m["value"]}" [{m["type"]}, key={m["key"]}]'
             for i, m in enumerate(memories)
         )
 
@@ -129,23 +129,10 @@ class LLMService:
         parsed = json.loads(content)
 
         indices = parsed.get("ranked_indices", [])
-        if indices:
-            valid = [idx for idx in indices if 0 <= idx < len(memories)]
-            oob = [idx for idx in indices if idx < 0 or idx >= len(memories)]
-            if valid and len(valid) >= len(oob):
-                parsed["ranked_indices"] = indices
-            else:
-                parsed["ranked_indices"] = [idx - 1 for idx in indices]
+        parsed["ranked_indices"] = [idx for idx in indices if 0 <= idx < len(memories)]
 
         for g in parsed.get("groups", []):
-            g_indices = g.get("indices", [])
-            if g_indices:
-                valid = [idx for idx in g_indices if 0 <= idx < len(memories)]
-                oob = [idx for idx in g_indices if idx < 0 or idx >= len(memories)]
-                if valid and len(valid) >= len(oob):
-                    g["indices"] = g_indices
-                else:
-                    g["indices"] = [idx - 1 for idx in g_indices]
+            g["indices"] = [idx for idx in g.get("indices", []) if 0 <= idx < len(memories)]
 
         return parsed
 

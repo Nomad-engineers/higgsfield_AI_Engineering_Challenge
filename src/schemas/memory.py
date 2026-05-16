@@ -10,6 +10,9 @@ class MemoryOut(BaseModel):
     key: str
     value: str
     confidence: float
+    extraction_method: str | None = None
+    turn_index: int | None = None
+    provenance: str | None = None
     active: bool
     source_session: str
     source_turn: str | None = None

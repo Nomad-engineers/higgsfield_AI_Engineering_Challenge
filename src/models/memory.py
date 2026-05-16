@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, Column, Computed, Float, ForeignKey, Index, String, Text
+from sqlalchemy import Boolean, Column, Computed, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import TIMESTAMP, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -18,6 +18,9 @@ class Memory(Base):
     key: Mapped[str] = mapped_column(String, nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default="1.0")
+    extraction_method: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    turn_index: Mapped[int | None] = mapped_column(nullable=True)
+    provenance: Mapped[str | None] = mapped_column(String, nullable=True)
     source_session: Mapped[str] = mapped_column(String, nullable=False)
     source_turn_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("turns.id", ondelete="SET NULL"), nullable=True

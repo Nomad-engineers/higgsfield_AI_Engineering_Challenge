@@ -6,11 +6,17 @@ from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import tiktoken
+
 from src.config import settings
 from src.repositories.memory_repo import MemoryRepo
 from src.repositories.turn_repo import TurnRepo
 from src.services.llm_service import llm_service
 from src.services.query import analyze_query, expand_query_for_bm25
+from src.prompts.temporal import parse_temporal
+from src.services.entity_graph import build_graph_from_memories
+
+_encoding = tiktoken.get_encoding("cl100k_base")
 
 logger = logging.getLogger(__name__)
 
@@ -23,30 +29,11 @@ STABLE_FACTS_MIN_DENSITY = 0.15
 KEY_MATCH_BOOST = 2.0
 SESSION_BOOST_ALPHA = 0.05
 
-KEY_RELATIONS = {
-    "pet": {"location", "name", "spouse", "child"},
-    "employer": {"occupation", "title", "location", "education"},
-    "spouse": {"spouse_occupation", "location", "child"},
-    "child": {"location", "name", "spouse"},
-    "location": {"employer", "pet", "name", "hobby"},
-    "programming_language": {"framework", "employer"},
-    "framework": {"programming_language", "employer"},
-    "dietary_restriction": {"allergy"},
-    "allergy": {"dietary_restriction"},
-    "education": {"employer", "occupation"},
-    "name": {"location", "employer"},
-    "occupation": {"employer", "location"},
-    "hobby": {"location", "occupation"},
-    "vehicle": {"location", "employer"},
-    "travel": {"location", "employer"},
-    "mobile_framework": {"programming_language", "employer"},
-    "sport": {"location", "hobby"},
-    "music": {"hobby", "location"},
-}
-
 
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 3)
+    if not text:
+        return 0
+    return len(_encoding.encode(text))
 
 
 def rrf_merge(
@@ -55,6 +42,7 @@ def rrf_merge(
     key_results: list[tuple] | None = None,
     k: int = RRF_K,
     session_id: str | None = None,
+    temporal_constraint: dict | None = None,
 ) -> list[tuple]:
     scores: dict[uuid.UUID, float] = {}
     memories: dict[uuid.UUID, object] = {}
@@ -81,9 +69,20 @@ def rrf_merge(
         days_old = (now - mem.created_at).days if mem.created_at else 0
         recency = 1.0 / (1.0 + days_old)
         adjusted = score * (1 + TEMPORAL_ALPHA * recency)
-        # Same-session boost: memories from the active session get a small advantage
         if session_id and hasattr(mem, 'source_session') and mem.source_session == session_id:
             adjusted *= (1 + SESSION_BOOST_ALPHA)
+
+        # Temporal constraint boost/filter
+        if temporal_constraint and mem.created_at:
+            tc = temporal_constraint
+            if tc.get("after") and mem.created_at < tc["after"]:
+                adjusted *= 0.3
+            if tc.get("before") and mem.created_at > tc["before"]:
+                adjusted *= 0.3
+            if tc.get("boost") and tc.get("after") and mem.created_at >= tc["after"]:
+                if not tc.get("before") or mem.created_at <= tc["before"]:
+                    adjusted *= tc["boost"]
+
         result.append((mem, adjusted))
     return result
 
@@ -97,7 +96,32 @@ def _group_by_key(memories: list) -> dict[str, list]:
     return dict(grouped)
 
 
-def format_stable_facts(memories: list, budget_tokens: int) -> str:
+def _render_evolution_arc(key: str, mems: list, compact: bool, superseded_chains: dict | None) -> str:
+    newest = mems[0]
+    chain = (superseded_chains or {}).get(newest.id, [])
+    is_evolution = newest.type in ("opinion", "preference") and (len(mems) > 1 or chain)
+
+    if is_evolution:
+        parts = []
+        if chain:
+            parts.extend(c.value for c in chain)
+        if len(mems) > 1:
+            parts.extend(o.value for o in reversed(mems[1:]))
+        parts.append(newest.value)
+        arc = " → ".join(parts)
+        return f"{key}: {arc}" if compact else f"- **{key}**: {arc}"
+
+    if len(mems) == 1:
+        return f"{newest.key}: {newest.value}" if compact else f"- **{newest.key}**: {newest.value}"
+
+    older = mems[1:]
+    evolution = "; ".join(o.value for o in reversed(older))
+    if compact:
+        return f"{newest.key}: {newest.value}"
+    return f"- **{newest.key}**: {newest.value} (previously: {evolution})"
+
+
+def format_stable_facts(memories: list, budget_tokens: int, superseded_chains: dict | None = None) -> str:
     if not memories:
         return ""
 
@@ -108,18 +132,7 @@ def format_stable_facts(memories: list, budget_tokens: int) -> str:
     compact = budget_tokens < 256
 
     for key, mems in grouped.items():
-        if len(mems) == 1:
-            m = mems[0]
-            line = f"{m.key}: {m.value}" if compact else f"- **{m.key}**: {m.value}"
-        else:
-            newest = mems[0]
-            older = mems[1:]
-            evolution = "; ".join(o.value for o in reversed(older))
-            if compact:
-                line = f"{newest.key}: {newest.value}"
-            else:
-                line = f"- **{newest.key}**: {newest.value} (previously: {evolution})"
-
+        line = _render_evolution_arc(key, mems, compact, superseded_chains)
         if used + len(line) + 1 > budget_chars:
             break
         lines.append(line)
@@ -214,6 +227,16 @@ class RecallService:
         self.memory_repo = MemoryRepo(session)
         self.turn_repo = TurnRepo(session)
 
+    async def _fetch_superseded_chains(self, memories: list) -> dict[uuid.UUID, list]:
+        """Fetch superseded chains for memories with a supersedes link."""
+        chains = {}
+        for m in memories:
+            if m.supersedes:
+                chain = await self.memory_repo.get_superseded_chain(m.id)
+                if chain:
+                    chains[m.id] = list(reversed(chain))
+        return chains
+
     async def recall(
         self,
         query: str,
@@ -230,6 +253,11 @@ class RecallService:
 
         # Query rewriting: decompose multi-hop queries into sub-queries
         sub_queries = await self._rewrite_query(query)
+
+        # Temporal constraint extraction
+        temporal_constraint = parse_temporal(query)
+        if temporal_constraint:
+            logger.info(f"Temporal constraint detected: after={temporal_constraint.get('after')}, before={temporal_constraint.get('before')}")
 
         # Embed all sub-queries in one batch
         try:
@@ -268,7 +296,7 @@ class RecallService:
                 key_results = key_results + expansion
                 logger.info(f"Entity expansion added {len(expansion)} memories for multi-hop")
 
-        fused = rrf_merge(all_vector_results, all_bm25_results, key_results, session_id=session_id)
+        fused = rrf_merge(all_vector_results, all_bm25_results, key_results, session_id=session_id, temporal_constraint=temporal_constraint)
         if not fused:
             logger.info(f"Recall: no fused results (vec={len(all_vector_results)} bm25={len(all_bm25_results)} key={len(key_results)}), query='{query[:50]}'")
             return await self._bm25_fallback_recall(query, user_id, max_tokens, session_id=session_id)
@@ -330,24 +358,27 @@ class RecallService:
         key_results: list[tuple],
     ) -> list[tuple]:
         found_keys = set()
+        all_memories = []
         for results in [vector_results, bm25_results, key_results]:
             for memory, _score in results:
                 found_keys.add(memory.key)
+                all_memories.append(memory)
 
         if not found_keys:
             return []
 
-        related_keys = set()
-        for key in found_keys:
-            if key in KEY_RELATIONS:
-                related_keys.update(KEY_RELATIONS[key])
+        # Build dynamic graph from all user memories + search results
+        user_memories = await self.memory_repo.get_active_by_user(user_id)
+        graph = build_graph_from_memories(user_memories)
 
+        # Expand from found keys using dynamic graph
+        related_keys = graph.expand(found_keys, depth=1)
         related_keys -= found_keys
 
         if not related_keys:
             return []
 
-        logger.info(f"Entity expansion: {found_keys} -> {related_keys}")
+        logger.info(f"Entity expansion (dynamic): {found_keys} -> {related_keys}")
         return await self.memory_repo.key_search(user_id, list(related_keys), limit=10)
 
     async def _rerank(
@@ -484,7 +515,8 @@ class RecallService:
             facts_budget = int(budget * 0.35)
             relevant_budget = int(budget * 0.50)
 
-        facts_text = format_stable_facts(stable_facts, facts_budget)
+        facts_chains = await self._fetch_superseded_chains(stable_facts) if stable_facts else {}
+        facts_text = format_stable_facts(stable_facts, facts_budget, superseded_chains=facts_chains)
         if facts_text:
             sections.append(facts_text)
         used = estimate_tokens(facts_text)
@@ -520,6 +552,7 @@ class RecallService:
         """BM25-based recall when embeddings/LLM are unavailable."""
         hints = analyze_query(query)
         expanded_query = expand_query_for_bm25(query)
+        temporal_constraint = parse_temporal(query)
 
         bm25_results = await self.memory_repo.bm25_search(user_id, expanded_query, limit=20)
 
@@ -533,7 +566,7 @@ class RecallService:
         if not bm25_results and not key_results:
             return "", []
 
-        fused = rrf_merge([], bm25_results, key_results, session_id=session_id)
+        fused = rrf_merge([], bm25_results, key_results, session_id=session_id, temporal_constraint=temporal_constraint)
 
         budget = max_tokens
         sections = []
@@ -542,7 +575,8 @@ class RecallService:
         # Stable facts (no embedding filter needed)
         stable_facts = await self.memory_repo.get_stable_facts(user_id)
         facts_budget = int(budget * 0.35)
-        facts_text = format_stable_facts(stable_facts, facts_budget)
+        facts_chains = await self._fetch_superseded_chains(stable_facts) if stable_facts else {}
+        facts_text = format_stable_facts(stable_facts, facts_budget, superseded_chains=facts_chains)
         if facts_text:
             sections.append(facts_text)
         used = estimate_tokens(facts_text)
@@ -569,30 +603,6 @@ class RecallService:
         if len(context) > max_chars:
             context = context[:max_chars] + "..."
 
-        return context, citations
-
-    async def _fallback_recall(
-        self, user_id: str, max_tokens: int
-    ) -> tuple[str, list[dict]]:
-        memories = await self.memory_repo.get_recent_by_user(user_id, limit=5)
-        if not memories:
-            return "", []
-
-        lines = []
-        citations = []
-        for m in memories:
-            line = f"- [{m.type}/{m.key}] {m.value}"
-            lines.append(line)
-            citations.append({
-                "turn_id": str(m.source_turn_id) if m.source_turn_id else None,
-                "score": 1.0,
-                "snippet": m.value[:100],
-            })
-
-        context = "## Recent Memories\n" + "\n".join(lines)
-        max_chars = max_tokens * 3
-        if len(context) > max_chars:
-            context = context[:max_chars]
         return context, citations
 
     async def _session_recall(

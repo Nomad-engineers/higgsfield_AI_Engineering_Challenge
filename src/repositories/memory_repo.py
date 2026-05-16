@@ -12,7 +12,8 @@ class MemoryRepo:
         self.session = session
 
     async def create(self, user_id, type, key, value, confidence, source_session,
-                     source_turn_id=None, supersedes=None) -> Memory:
+                     source_turn_id=None, supersedes=None, extraction_method=None,
+                     turn_index=None, provenance=None) -> Memory:
         memory = Memory(
             user_id=user_id,
             type=type,
@@ -22,6 +23,9 @@ class MemoryRepo:
             source_session=source_session,
             source_turn_id=source_turn_id,
             supersedes=supersedes,
+            extraction_method=extraction_method,
+            turn_index=turn_index,
+            provenance=provenance,
         )
         self.session.add(memory)
         await self.session.flush()
@@ -95,7 +99,7 @@ class MemoryRepo:
 
     async def key_search(self, user_id: str, keys: list[str],
                         limit: int = 20) -> list[tuple[Memory, float]]:
-        """Direct SQL match on memory key column — deterministic recall boost."""
+        """Direct SQL match on memory key column - deterministic recall boost."""
         if not keys:
             return []
         placeholders = ", ".join(f":k{i}" for i in range(len(keys)))
@@ -105,7 +109,8 @@ class MemoryRepo:
 
         stmt = text(f"""
             SELECT id, user_id, type, key, value, confidence, source_session,
-                   source_turn_id, supersedes, active, created_at, updated_at
+                   source_turn_id, supersedes, active, created_at, updated_at,
+                   extraction_method, turn_index, provenance
             FROM memories
             WHERE user_id = :user_id
               AND active = TRUE
@@ -123,7 +128,8 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None,
+                embedding=None, extraction_method=row.extraction_method,
+                turn_index=row.turn_index, provenance=row.provenance,
             )
             memories.append((m, m.confidence))
         return memories
@@ -164,6 +170,7 @@ class MemoryRepo:
         stmt = text("""
             SELECT id, user_id, type, key, value, confidence, source_session,
                    source_turn_id, supersedes, active, created_at, updated_at,
+                   extraction_method, turn_index, provenance,
                    1 - (embedding <=> :embedding) AS similarity
             FROM memories
             WHERE user_id = :user_id
@@ -185,7 +192,8 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None,
+                embedding=None, extraction_method=row.extraction_method,
+                turn_index=row.turn_index, provenance=row.provenance,
             )
             memories.append((m, float(row.similarity)))
         return memories
@@ -202,6 +210,7 @@ class MemoryRepo:
             SELECT m.id, m.user_id, m.type, m.key, m.value, m.confidence,
                    m.source_session, m.source_turn_id, m.supersedes, m.active,
                    m.created_at, m.updated_at,
+                   m.extraction_method, m.turn_index, m.provenance,
                    ts_rank_cd(m.search_vector, tsq.q) AS bm25_score
             FROM memories m, tsq
             WHERE m.user_id = :user_id
@@ -222,7 +231,8 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None,
+                embedding=None, extraction_method=row.extraction_method,
+                turn_index=row.turn_index, provenance=row.provenance,
             )
             memories.append((m, float(row.bm25_score)))
         return memories
@@ -253,6 +263,7 @@ class MemoryRepo:
         stmt = text(f"""
             SELECT id, user_id, type, key, value, confidence, source_session,
                    source_turn_id, supersedes, active, created_at, updated_at,
+                   extraction_method, turn_index, provenance,
                    1 - (embedding <=> :embedding) AS similarity
             FROM memories
             WHERE {' AND '.join(conditions)}
@@ -269,7 +280,8 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None,
+                embedding=None, extraction_method=row.extraction_method,
+                turn_index=row.turn_index, provenance=row.provenance,
             )
             memories.append((m, float(row.similarity)))
         return memories
@@ -292,7 +304,8 @@ class MemoryRepo:
     ) -> list[Memory]:
         stmt = text("""
             SELECT id, user_id, type, key, value, confidence, source_session,
-                   source_turn_id, supersedes, active, created_at, updated_at
+                   source_turn_id, supersedes, active, created_at, updated_at,
+                   extraction_method, turn_index, provenance
             FROM memories
             WHERE user_id = :user_id
               AND active = TRUE
@@ -319,7 +332,8 @@ class MemoryRepo:
                 source_session=row.source_session, source_turn_id=row.source_turn_id,
                 supersedes=row.supersedes, active=row.active,
                 created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None,
+                embedding=None, extraction_method=row.extraction_method,
+                turn_index=row.turn_index, provenance=row.provenance,
             )
             memories.append(m)
         return memories

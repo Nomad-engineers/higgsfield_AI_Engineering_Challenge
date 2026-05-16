@@ -35,7 +35,7 @@ class ExtractionService:
         turn_id=None,
     ) -> list[dict]:
         if not user_id:
-            logger.info("Skipping extraction — no user_id")
+            logger.info("Skipping extraction - no user_id")
             return []
 
         # Rules always run
@@ -62,6 +62,8 @@ class ExtractionService:
 
         for mem in raw_memories:
             mem["confidence"] = max(0.0, min(1.0, mem.get("confidence", 1.0)))
+            mem.setdefault("turn_index", None)
+            mem.setdefault("provenance", f"session:{session_id}")
             memory = await self._resolve_memory(
                 user_id=user_id,
                 session_id=session_id,
@@ -70,6 +72,9 @@ class ExtractionService:
                 key=mem["key"],
                 value=mem["value"],
                 confidence=mem["confidence"],
+                extraction_method=mem.get("extraction_method"),
+                turn_index=mem.get("turn_index"),
+                provenance=mem.get("provenance"),
             )
             if memory:
                 stored.append(memory)
@@ -96,13 +101,13 @@ class ExtractionService:
 
         for r in rules:
             key = normalize_key(r["key"])
-            merged[key] = {**r, "key": key}
+            merged[key] = {**r, "key": key, "extraction_method": "rule"}
 
         for r in llm:
             key = normalize_key(r.get("key", ""))
             if not key:
                 continue
-            merged[key] = {**r, "key": key}
+            merged[key] = {**r, "key": key, "extraction_method": "llm"}
 
         return list(merged.values())
 
@@ -139,6 +144,9 @@ class ExtractionService:
         key: str,
         value: str,
         confidence: float,
+        extraction_method: str | None = None,
+        turn_index: int | None = None,
+        provenance: str | None = None,
     ) -> object | None:
         existing = await self.memory_repo.get_active_by_key(user_id, key, for_update=False)
 
@@ -151,6 +159,9 @@ class ExtractionService:
                 confidence=confidence,
                 source_session=session_id,
                 source_turn_id=turn_id,
+                extraction_method=extraction_method,
+                turn_index=turn_index,
+                provenance=provenance,
             )
             logger.info(f"New memory: {key}={value[:80]}")
             return memory
@@ -180,25 +191,19 @@ class ExtractionService:
                 confidence=confidence,
                 source_session=session_id,
                 source_turn_id=turn_id,
+                extraction_method=extraction_method,
+                turn_index=turn_index,
+                provenance=provenance,
             )
             logger.info(f"New memory (existing key but unrelated): {key}={value[:80]}")
             return memory
 
-        if best_relationship == "nuance":
-            memory = await self.memory_repo.create(
-                user_id=user_id,
-                type=type_,
-                key=key,
-                value=value,
-                confidence=min(1.0, max(confidence, best_match.confidence) + 0.05),
-                source_session=session_id,
-                source_turn_id=turn_id,
-                supersedes=best_match.id,
-            )
-            logger.info(f"Nuance added for {key}: {value[:80]} (old kept active)")
-            return memory
-
         await self.memory_repo.deactivate_by_id(best_match.id)
+        confidence = (
+            min(1.0, max(confidence, best_match.confidence) + 0.05)
+            if best_relationship == "nuance"
+            else confidence
+        )
         memory = await self.memory_repo.create(
             user_id=user_id,
             type=type_,
@@ -208,6 +213,9 @@ class ExtractionService:
             source_session=session_id,
             source_turn_id=turn_id,
             supersedes=best_match.id,
+            extraction_method=extraction_method,
+            turn_index=turn_index,
+            provenance=provenance,
         )
         logger.info(
             f"{best_relationship.title()}: {key} "

@@ -148,11 +148,11 @@ class TestFormatRelevantMemories:
 
 class TestEstimateTokens:
     def test_empty(self):
-        assert estimate_tokens("") == 1
+        assert estimate_tokens("") == 0
 
     def test_short_text(self):
-        assert estimate_tokens("hello") == 1  # max(1, len//3) = max(1, 1)
+        assert estimate_tokens("hello") >= 1
 
     def test_long_text(self):
         text = "a" * 300
-        assert estimate_tokens(text) == 100
+        assert estimate_tokens(text) >= 30
