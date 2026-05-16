@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 class Message(BaseModel):
     role: str
     content: str
+    name: str | None = None
 
 
 class TurnCreate(BaseModel):

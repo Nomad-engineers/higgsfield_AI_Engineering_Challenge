@@ -41,7 +41,8 @@ class LLMService:
         from src.prompts.extract import EXTRACTION_SYSTEM_PROMPT, EXTRACTION_SCHEMA
 
         user_content = "\n".join(
-            f"{m['role']}: {m['content']}" for m in messages
+            f"{m['role']}" + (f" ({m['name']})" if m.get('name') else "") + f": {m['content']}"
+            for m in messages
         )
 
         data = await self._post_with_retry(

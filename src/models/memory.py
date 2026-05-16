@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, Column, Float, Index, String, Text
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,7 +20,7 @@ class Memory(Base):
     confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default="1.0")
     source_session: Mapped[str] = mapped_column(String, nullable=False)
     source_turn_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True), ForeignKey("turns.id", ondelete="SET NULL"), nullable=True
     )
     supersedes: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")

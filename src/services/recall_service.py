@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 RRF_K = 60
 RERANK_TOP_K = 15
+RECALL_RELEVANCE_THRESHOLD = 0.25
 
 
 def estimate_tokens(text: str) -> int:
@@ -174,7 +175,7 @@ class RecallService:
         reranked = await self._rerank(query, fused)
 
         return await self._assemble_context(
-            query, user_id, reranked, session_id, max_tokens
+            query, user_id, reranked, session_id, max_tokens, query_embedding
         )
 
     async def _hybrid_search(
@@ -231,14 +232,23 @@ class RecallService:
         reranked: list[tuple],
         session_id: str | None,
         max_tokens: int,
+        query_embedding: list[float] | None = None,
     ) -> tuple[str, list[dict]]:
         budget = max_tokens
         sections = []
         citations = []
 
-        # Phase 1: Stable facts (35% budget)
+        # Phase 1: Stable facts (35% budget) — only if query-relevant
         facts_budget = int(budget * 0.35)
-        stable_facts = await self.memory_repo.get_stable_facts(user_id)
+        if not reranked:
+            stable_facts = []
+        elif query_embedding:
+            stable_facts = await self.memory_repo.get_relevant_facts(
+                user_id, query_embedding, min_similarity=RECALL_RELEVANCE_THRESHOLD
+            )
+        else:
+            stable_facts = await self.memory_repo.get_stable_facts(user_id)
+
         facts_text = format_stable_facts(stable_facts, facts_budget)
         if facts_text:
             sections.append(facts_text)

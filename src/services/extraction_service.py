@@ -83,27 +83,22 @@ class ExtractionService:
             logger.info(f"New memory: {key}={value[:80]}")
             return memory
 
-        # Check relationship with each existing memory of same key
+        # Compare only with the most recent memory for this key
+        old_mem = existing[0]
         best_relationship = "new"
-        best_match = existing[0]
+        best_match = old_mem
 
-        for old_mem in existing:
-            try:
-                result = await llm_service.check_contradiction(
-                    key=key, old_value=old_mem.value, new_value=value
-                )
-                relationship = result.get("relationship", "new")
-                logger.info(
-                    f"Contradiction check: {key} -> {relationship} "
-                    f"({result.get('reason', '')[:60]})"
-                )
-                if relationship != "new":
-                    best_relationship = relationship
-                    best_match = old_mem
-                    break
-            except Exception as e:
-                logger.warning(f"Contradiction check failed: {e}")
-                continue
+        try:
+            result = await llm_service.check_contradiction(
+                key=key, old_value=old_mem.value, new_value=value
+            )
+            best_relationship = result.get("relationship", "new")
+            logger.info(
+                f"Contradiction check: {key} -> {best_relationship} "
+                f"({result.get('reason', '')[:60]})"
+            )
+        except Exception as e:
+            logger.warning(f"Contradiction check failed: {e}")
 
         if best_relationship == "new":
             memory = await self.memory_repo.create(

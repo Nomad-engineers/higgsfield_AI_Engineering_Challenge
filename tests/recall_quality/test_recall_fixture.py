@@ -137,3 +137,22 @@ def test_recall_empty_for_unknown_user(client):
     body = resp.json()
     assert body["context"] == ""
     assert body["citations"] == []
+
+
+def test_noise_resistance_unrelated_query(client, fixtures):
+    """Unrelated query should not dump entire user profile."""
+    resp = client.post("/recall", json={
+        "query": "What car does the user drive?",
+        "session_id": "noise-test-session",
+        "user_id": "alice",
+        "max_tokens": 512,
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    context = body["context"].lower()
+
+    unrelated_facts = ["shellfish", "carlos", "japan", "biscuit", "golden retriever"]
+    leaked = [f for f in unrelated_facts if f in context]
+    assert not leaked, (
+        f"Noise leak: unrelated facts {leaked} found in context for car query"
+    )

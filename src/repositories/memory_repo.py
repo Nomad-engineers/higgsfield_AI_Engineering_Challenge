@@ -194,3 +194,40 @@ class MemoryRepo:
             .order_by(Memory.confidence.desc(), Memory.created_at.desc())
         )
         return list(result.scalars().all())
+
+    async def get_relevant_facts(
+        self, user_id: str, query_embedding: list[float],
+        min_confidence: float = 0.8, min_similarity: float = 0.3,
+    ) -> list[Memory]:
+        stmt = text("""
+            SELECT id, user_id, type, key, value, confidence, source_session,
+                   source_turn_id, supersedes, active, created_at, updated_at
+            FROM memories
+            WHERE user_id = :user_id
+              AND active = TRUE
+              AND confidence >= :min_confidence
+              AND embedding IS NOT NULL
+              AND 1 - (embedding <=> :embedding) >= :min_similarity
+            ORDER BY (1 - (embedding <=> :embedding)) DESC
+        """)
+        result = await self.session.execute(
+            stmt,
+            {
+                "user_id": user_id,
+                "embedding": str(query_embedding),
+                "min_confidence": min_confidence,
+                "min_similarity": min_similarity,
+            },
+        )
+        rows = result.fetchall()
+        memories = []
+        for row in rows:
+            m = Memory(
+                id=row.id, user_id=row.user_id, type=row.type, key=row.key,
+                value=row.value, confidence=row.confidence,
+                source_session=row.source_session, source_turn_id=row.source_turn_id,
+                supersedes=row.supersedes, active=row.active,
+                created_at=row.created_at, updated_at=row.updated_at,
+            )
+            memories.append(m)
+        return memories
