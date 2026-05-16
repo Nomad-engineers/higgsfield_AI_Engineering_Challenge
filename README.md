@@ -15,10 +15,11 @@ A Dockerized memory service that ingests conversation turns, extracts structured
 │  ┌───────────────────────▼───────────────────────────┐   │
 │  │                  Services                          │   │
 │  │  ExtractionService  RecallService  SearchService   │   │
-│  │  MemoryService      LLMService                    │   │
+│  │  MemoryService      LLMService     QueryVocab     │   │
 │  │                                                    │   │
 │  │  LLM prompts: extract, contradiction,              │   │
 │  │  cross_key_contradiction, query_rewrite, rerank    │   │
+│  │  Query vocab: 15 hint patterns → key + synonyms   │   │
 │  └───────────────────────┬───────────────────────────┘   │
 │                          │                                │
 │  ┌───────────────────────▼───────────────────────────┐   │
@@ -76,22 +77,24 @@ All Pydantic schemas use `extra="forbid"` — unknown fields in request bodies a
 
 ## Recall Strategy
 
-`POST /recall` runs a 7-stage pipeline (with BM25-only fallback when no API key):
+`POST /recall` runs a 9-stage pipeline (with BM25-only fallback when no API key):
 
 1. **Query rewriting** — LLM decomposes multi-hop queries into 2-3 sub-queries. Simple queries pass through unchanged. Sub-query embeddings batched in one API call. (Skipped without API key.)
-2. **Vector search** — pgvector HNSW cosine similarity, top-20 candidates per sub-query
-3. **BM25 search** — pre-computed `tsvector` column with GIN index + `websearch_to_tsquery` (falls back to `plainto_tsquery`), top-20 candidates per sub-query
-4. **Reciprocal Rank Fusion** (k=60) — merge all sub-query result sets, deduplicate by memory ID
-5. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking with multi-hop reasoning. Returns grouped memories that jointly answer the query. (Skipped without API key.)
-6. **Noise gating** — similarity thresholds filter irrelevant results: 0.30 floor for query-relevant filtering, 0.20 noise floor for reranked results; stable facts skip entirely when no query-relevant results pass the threshold
-7. **Context assembly** — format ranked memories into structured text under the token budget, showing only current values (evolution history preserved in stable facts section but excluded from query-relevant results to save tokens)
+2. **Query hint analysis** — 15 regex patterns map the query to canonical memory keys (location, pet, employer, food_preferences, etc.) and expand with domain-specific synonyms. No LLM needed — runs on every query.
+3. **Vector search** — pgvector HNSW cosine similarity, top-30 candidates per sub-query
+4. **BM25 search** — expanded query (original + hint synonyms) against pre-computed `tsvector` with GIN index, top-30 candidates per sub-query
+5. **Key search** — direct SQL `WHERE key IN (...)` for hint-matched canonical keys, deterministic recall boost (bypasses fuzzy search entirely)
+6. **Reciprocal Rank Fusion** (k=60) — merge vector + BM25 + key results. Key matches get 2x weight (`KEY_MATCH_BOOST`). Same-session memories get a small recency advantage (`SESSION_BOOST_ALPHA=0.05`). Temporal decay favors recent memories.
+7. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking with multi-hop reasoning. Returns grouped memories that jointly answer the query. (Skipped without API key.)
+8. **Noise gating** — three authority tiers: key match (highest authority) > vector similarity > BM25-only. Similarity thresholds filter irrelevant results: 0.25 floor for query-relevant filtering, 0.20 noise floor for reranked results; stable facts skip entirely when no authoritative results survive.
+9. **Context assembly** — format ranked memories into structured text under the token budget, showing only current values (evolution history preserved in stable facts section but excluded from query-relevant results to save tokens)
 
 ### BM25-only Fallback (no API key)
 
 When `OPENAI_API_KEY` is not set, recall and search operate without embeddings or LLM calls:
 
-- **`/recall`** uses BM25 keyword search to find relevant memories, assembles context with the same token budget priority (stable facts 35%, query-relevant 50%, recent context 15%). Returns empty context if BM25 returns no matches — avoids dumping irrelevant recent memories.
-- **`/search`** uses BM25 keyword search directly, returning scored results. Falls back to recent memories if BM25 returns no matches.
+- **`/recall`** uses BM25 keyword search with query-expanded synonyms from hint vocabulary, plus canonical key matching for deterministic recall. Assembles context with the same token budget priority (stable facts 35%, query-relevant 50%, recent context 15%). Returns empty context if both BM25 and key search return no matches — avoids dumping irrelevant recent memories.
+- **`/search`** uses expanded BM25 keyword search with key matching, returning scored results. Falls back to recent memories if both BM25 and key search return no matches.
 - Rule-based extraction still runs, so memories are created and stored — just without LLM enrichment.
 
 ### Token Budget Priority
@@ -159,9 +162,13 @@ This is a deliberate tradeoff: showing all opinions in recall context would cons
 
 **Query rewriting with cheap gate.** Queries ≤ 4 words skip the rewrite LLM call entirely. Longer queries are decomposed into sub-queries only when the LLM flags `is_multi_hop: true`. Most queries pass through unchanged.
 
+**Query hint vocabulary.** 15 regex patterns map natural-language queries to canonical memory keys and expand with domain synonyms — no LLM needed. "What's their dog's name?" matches the `pet` key and adds "dog", "cat", "animal", "pet name", "breed" to the BM25 query. Key search provides deterministic SQL matching that bypasses fuzzy vector/keyword search entirely. This is the third retrieval signal alongside vector and BM25.
+
+**Session-aware RRF.** The fusion function applies a small boost (`SESSION_BOOST_ALPHA=0.05`) to memories from the active session, and temporal decay (`TEMPORAL_ALPHA=0.1`) favoring recent memories. Key matches get 2x weight in fusion to ensure deterministic hits always surface above fuzzy matches.
+
 **Embeddings on memories table.** Fewer joins = simpler queries, faster recall. Tradeoff: one embedding per memory (sufficient for atomic facts).
 
-**Search endpoint.** `/search` includes LLM reranking (top-10 candidates after RRF fusion) when the API key is available, and returns `key` and `type` fields alongside the `content` field. BM25 uses `websearch_to_tsquery` with `plainto_tsquery` fallback for better phrase handling. Without an API key, search uses BM25-only with scored results. Callers needing the full structured memory graph should use `/users/{user_id}/memories`.
+**Search endpoint.** `/search` includes LLM reranking (top-10 candidates after RRF fusion) when the API key is available, and returns `key` and `type` fields alongside the `content` field. BM25 uses `websearch_to_tsquery` with `plainto_tsquery` fallback for better phrase handling. Query hint vocabulary expands BM25 queries and key search provides deterministic matches. Without an API key, search uses BM25-only with query expansion and key matching. Callers needing the full structured memory graph should use `/users/{user_id}/memories`.
 
 ## Failure Modes
 
@@ -215,6 +222,19 @@ docker compose exec app python -m pytest tests/test_extraction_e2e.py -v
 
 # All container-based tests
 docker compose exec app python -m pytest tests/contract/ tests/robustness/ tests/recall_quality/ tests/test_extraction_e2e.py -v
+```
+
+Hermetic tests (no Docker, no API key, no database — pure unit tests):
+
+```bash
+# Query vocabulary and RRF merge logic
+python -m pytest tests/hermetic/ -v
+```
+
+End-to-end smoke test (requires running Docker stack):
+
+```bash
+bash test_comprehensive.sh
 ```
 
 The persistence test must run from the **host** (it restarts the Docker stack, so it can't run inside the container):
