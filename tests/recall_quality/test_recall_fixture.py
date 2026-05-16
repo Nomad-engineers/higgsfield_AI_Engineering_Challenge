@@ -1,4 +1,4 @@
-"""Recall quality test using scripted conversations.
+"""Recall quality test using scripted conversations + probe-based grading.
 
 Runs against the live Docker Compose stack with a real OpenAI API key.
 Usage:
@@ -22,9 +22,15 @@ def client():
 
 
 @pytest.fixture(scope="module")
-def fixtures():
+def conversations():
     with open(os.path.join(FIXTURES_DIR, "conversations.json")) as f:
         return json.load(f)
+
+
+@pytest.fixture(scope="module")
+def probes():
+    with open(os.path.join(FIXTURES_DIR, "probes.json")) as f:
+        return json.load(f)["probes"]
 
 
 def _cleanup(client, user_id):
@@ -32,12 +38,12 @@ def _cleanup(client, user_id):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def seed_data(client, fixtures):
+def seed_data(client, conversations):
     """Post all conversations before tests, clean up after."""
-    for conv in fixtures["conversations"]:
+    for conv in conversations["conversations"]:
         _cleanup(client, conv["user_id"])
 
-    for conv in fixtures["conversations"]:
+    for conv in conversations["conversations"]:
         for turn in conv["turns"]:
             resp = client.post("/turns", json={
                 "session_id": conv["session_id"],
@@ -50,12 +56,11 @@ def seed_data(client, fixtures):
 
     yield
 
-    for conv in fixtures["conversations"]:
+    for conv in conversations["conversations"]:
         _cleanup(client, conv["user_id"])
 
 
 def _recall_contains(context: str, expected_facts: list[str]) -> tuple[int, int]:
-    """Return (matched, total) for expected facts in recall context."""
     matched = 0
     for fact in expected_facts:
         if fact.lower() in context.lower():
@@ -63,13 +68,83 @@ def _recall_contains(context: str, expected_facts: list[str]) -> tuple[int, int]
     return matched, len(expected_facts)
 
 
-def test_recall_queries(client, fixtures):
-    """Run all probe queries and check recall quality."""
+# --- Probe-based recall quality ---
+
+
+def test_probe_recall_quality(client, probes):
+    """Run all probes from probes.json and grade with must_match/must_not."""
+    results = {"pass": 0, "fail": 0, "total": len(probes)}
+    details = []
+
+    for probe in probes:
+        resp = client.post("/recall", json={
+            "query": probe["query"],
+            "session_id": f"probe-{probe['id']}",
+            "user_id": probe["user_id"],
+            "max_tokens": probe.get("max_tokens", 512),
+        })
+        assert resp.status_code == 200, f"Recall failed for probe {probe['id']}: {resp.text}"
+        data = resp.json()
+        context = data["context"].lower()
+
+        if probe.get("expect_empty"):
+            if not context:
+                results["pass"] += 1
+                details.append({"id": probe["id"], "status": "PASS", "reason": "empty as expected"})
+            else:
+                results["fail"] += 1
+                details.append({"id": probe["id"], "status": "FAIL", "reason": f"expected empty, got {len(context)} chars"})
+            time.sleep(1)
+            continue
+
+        must_match = [m.lower() for m in probe.get("must_match", [])]
+        must_not = [m.lower() for m in probe.get("must_not", [])]
+
+        matched = all(m in context for m in must_match)
+        avoided = all(m not in context for m in must_not)
+
+        if matched and avoided:
+            results["pass"] += 1
+            details.append({"id": probe["id"], "status": "PASS", "reason": ""})
+        else:
+            results["fail"] += 1
+            reasons = []
+            missing = [m for m in must_match if m not in context]
+            leaked = [m for m in must_not if m in context]
+            if missing:
+                reasons.append(f"missing: {missing}")
+            if leaked:
+                reasons.append(f"leaked: {leaked}")
+            details.append({"id": probe["id"], "status": "FAIL", "reason": "; ".join(reasons)})
+
+        time.sleep(1)
+
+    print("\n" + "=" * 60)
+    print("PROBE-BASED RECALL QUALITY REPORT")
+    print("=" * 60)
+    for d in details:
+        reason = f" — {d['reason']}" if d["reason"] else ""
+        print(f"  [{d['status']}] {d['id']}: {reason}")
+    print("-" * 60)
+    pct = results["pass"] / results["total"] * 100 if results["total"] else 0
+    print(f"  OVERALL: {results['pass']}/{results['total']} ({pct:.0f}%)")
+    print("=" * 60)
+
+    assert results["pass"] >= results["total"] * 0.6, (
+        f"Too few probes passed: {results['pass']}/{results['total']}"
+    )
+
+
+# --- Legacy probe queries (from conversations.json) ---
+
+
+def test_recall_queries(client, conversations):
+    """Run all legacy probe queries and check recall quality."""
     results = []
     total_matched = 0
     total_expected = 0
 
-    for probe in fixtures["probe_queries"]:
+    for probe in conversations["probe_queries"]:
         resp = client.post("/recall", json={
             "query": probe["query"],
             "session_id": probe.get("session_id", "probe-session"),
@@ -98,7 +173,7 @@ def test_recall_queries(client, fixtures):
     overall = (total_matched / total_expected * 100) if total_expected > 0 else 0
 
     print("\n" + "=" * 60)
-    print("RECALL QUALITY REPORT")
+    print("RECALL QUALITY REPORT (legacy probes)")
     print("=" * 60)
     for r in results:
         status = "PASS" if r["pct"] >= 70 else "FAIL"
@@ -110,9 +185,12 @@ def test_recall_queries(client, fixtures):
     assert overall >= 70, f"Recall quality {overall:.0f}% is below 70% threshold"
 
 
-def test_recall_returns_citations(client, fixtures):
+# --- Specific behavior tests ---
+
+
+def test_recall_returns_citations(client, conversations):
     """Verify recall responses include proper citations."""
-    probe = fixtures["probe_queries"][0]
+    probe = conversations["probe_queries"][0]
     resp = client.post("/recall", json={
         "query": probe["query"],
         "session_id": probe.get("session_id", "probe-session"),
@@ -150,12 +228,8 @@ def test_fact_evolution_employer_is_current(client):
     assert resp.status_code == 200
     context = resp.json()["context"].lower()
 
-    assert "stripe" in context, (
-        "Expected current employer 'Stripe' in recall context"
-    )
-    assert "notion" not in context, (
-        "Old employer 'Notion' should NOT appear — it was superseded by Stripe"
-    )
+    assert "stripe" in context, "Expected current employer 'Stripe' in recall context"
+    assert "notion" not in context, "Old employer 'Notion' should NOT appear — superseded by Stripe"
 
 
 def test_fact_evolution_history_preserved(client):
@@ -177,18 +251,12 @@ def test_fact_evolution_history_preserved(client):
     assert stripe_mem["active"] is True, "Stripe memory should be active"
 
     assert notion_mem is not None, "Expected a Notion employer memory to exist"
-    assert notion_mem["active"] is False, (
-        "Notion memory should be inactive — superseded by Stripe"
-    )
-    assert notion_mem["superseded_by"] is not None, (
-        "Notion memory should have superseded_by set"
-    )
-    assert notion_mem["superseded_by"] == stripe_mem["id"], (
-        "Notion's superseded_by should point to the Stripe memory"
-    )
+    assert notion_mem["active"] is False, "Notion memory should be inactive — superseded by Stripe"
+    assert notion_mem["superseded_by"] is not None, "Notion memory should have superseded_by set"
+    assert notion_mem["superseded_by"] == stripe_mem["id"], "Notion's superseded_by should point to the Stripe memory"
 
 
-def test_noise_resistance_unrelated_query(client, fixtures):
+def test_noise_resistance_unrelated_query(client):
     """Unrelated query should not dump entire user profile."""
     resp = client.post("/recall", json={
         "query": "What car does the user drive?",
@@ -202,9 +270,7 @@ def test_noise_resistance_unrelated_query(client, fixtures):
 
     unrelated_facts = ["shellfish", "carlos", "japan", "biscuit", "golden retriever"]
     leaked = [f for f in unrelated_facts if f in context]
-    assert not leaked, (
-        f"Noise leak: unrelated facts {leaked} found in context for car query"
-    )
+    assert not leaked, f"Noise leak: unrelated facts {leaked} found in context for car query"
 
 
 def test_noise_resistance_context_is_minimal_for_unrelated(client):

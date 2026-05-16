@@ -1,0 +1,118 @@
+{
+  "probes": [
+    {
+      "id": "P1",
+      "query": "Where does this user live?",
+      "user_id": "alice",
+      "must_match": ["Berlin"],
+      "must_not": ["NYC", "New York"],
+      "max_tokens": 512
+    },
+    {
+      "id": "P2",
+      "query": "What is the user's dog's name?",
+      "user_id": "alice",
+      "must_match": ["Biscuit"],
+      "must_not": [],
+      "max_tokens": 256
+    },
+    {
+      "id": "P3",
+      "query": "What city does the person whose dog is Biscuit live in?",
+      "user_id": "alice",
+      "must_match": ["Berlin"],
+      "must_not": [],
+      "max_tokens": 512,
+      "multi_hop": true
+    },
+    {
+      "id": "P4",
+      "query": "What's the capital of France?",
+      "user_id": "alice",
+      "must_match": [],
+      "must_not": [],
+      "max_tokens": 256,
+      "expect_empty": true
+    },
+    {
+      "id": "P5",
+      "query": "What does this user do for work?",
+      "user_id": "alice",
+      "must_match": ["Stripe"],
+      "must_not": ["Notion"],
+      "max_tokens": 512
+    },
+    {
+      "id": "P6",
+      "query": "Does this user have any dietary restrictions?",
+      "user_id": "alice",
+      "must_match": ["vegetarian", "shellfish"],
+      "must_not": [],
+      "max_tokens": 512
+    },
+    {
+      "id": "P7",
+      "query": "What programming languages does the user prefer?",
+      "user_id": "alice",
+      "must_match": ["Python", "TypeScript"],
+      "must_not": [],
+      "max_tokens": 512
+    },
+    {
+      "id": "P8",
+      "query": "What's the user's spouse's name?",
+      "user_id": "alice",
+      "must_match": ["Carlos"],
+      "must_not": [],
+      "max_tokens": 256
+    },
+    {
+      "id": "P9",
+      "query": "Where does Bob live and what does he do?",
+      "user_id": "bob",
+      "must_match": ["Tokyo", "Sony"],
+      "must_not": [],
+      "max_tokens": 512
+    },
+    {
+      "id": "P10",
+      "query": "What are Bob's pets' names?",
+      "user_id": "bob",
+      "must_match": ["Mochi", "Soba"],
+      "must_not": [],
+      "max_tokens": 256
+    },
+    {
+      "id": "P11",
+      "query": "Where did the user travel recently?",
+      "user_id": "alice",
+      "must_match": ["Japan"],
+      "must_not": [],
+      "max_tokens": 256
+    },
+    {
+      "id": "P12",
+      "query": "When is the user's birthday?",
+      "user_id": "alice",
+      "must_match": ["April 5"],
+      "must_not": [],
+      "max_tokens": 256
+    },
+    {
+      "id": "P13",
+      "query": "What framework is the user's mobile app built with?",
+      "user_id": "alice",
+      "must_match": ["React Native"],
+      "must_not": [],
+      "max_tokens": 256
+    },
+    {
+      "id": "P14",
+      "query": "What does the user's spouse do for work?",
+      "user_id": "alice",
+      "must_match": ["teacher"],
+      "must_not": [],
+      "max_tokens": 256
+    }
+  ]
+}
