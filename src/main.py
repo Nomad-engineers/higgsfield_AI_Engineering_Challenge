@@ -24,7 +24,6 @@ async def _init_schema():
         await conn.execute(
             __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector")
         )
-
         await conn.run_sync(_create_tables)
 
     logger.info("Database schema initialized")
@@ -39,7 +38,20 @@ def _create_tables(sync_conn):
 
 app = FastAPI(title="Memory Service", version="0.1.0", lifespan=lifespan)
 
+# Middleware
+from src.middleware.auth import AuthMiddleware
+from src.middleware.error_handler import ErrorHandlerMiddleware
 
-from src.routers import health  # noqa: E402
+app.add_middleware(ErrorHandlerMiddleware)
+if settings.MEMORY_AUTH_TOKEN:
+    app.add_middleware(AuthMiddleware, token=settings.MEMORY_AUTH_TOKEN)
+
+# Routers
+from src.routers import cleanup, health, memories, recall, search, turns  # noqa: E402
 
 app.include_router(health.router)
+app.include_router(turns.router)
+app.include_router(recall.router)
+app.include_router(search.router)
+app.include_router(memories.router)
+app.include_router(cleanup.router)
