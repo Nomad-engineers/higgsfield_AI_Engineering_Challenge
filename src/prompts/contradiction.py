@@ -19,6 +19,27 @@ Be generous with "nuance" — if the new statement adds information or \
 refines the old one without making it wrong, classify as "nuance". \
 Only use "contradiction" when the statements are logically incompatible.
 
+CRITICAL RULES:
+1. A sentiment or opinion about a topic is NOT an update to a factual \
+memory about that topic. "Loving living in Berlin" is an opinion about \
+Berlin, not a new location. "Enjoys working at Stripe" does not update \
+"Works at Stripe".
+2. If the old memory states a FACT (where, what job, which city) and \
+the new memory expresses a FEELING or OPINION about that same thing, \
+classify as "new" — they are different types of information.
+3. Only classify as "update" or "contradiction" when the same TYPE of \
+information conflicts (fact vs fact, not fact vs opinion).
+
+Examples:
+- Old: "Lives in Berlin" → New: "Loves living in Berlin" → "new" \
+(opinion about location, not a new location)
+- Old: "Works at Stripe" → New: "Really enjoys the team at Stripe" → "new" \
+(opinion about employer, not a new employer)
+- Old: "Lives in NYC" → New: "Lives in Berlin, moved from NYC" → "update" \
+(genuine location change)
+- Old: "Loves Python" → New: "Prefers TypeScript now" → "update" \
+(preference changed)
+
 Return JSON with "relationship" and "reason" fields.
 """
 

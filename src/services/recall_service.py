@@ -42,6 +42,8 @@ def _group_by_key(memories: list) -> dict[str, list]:
     grouped = defaultdict(list)
     for m in memories:
         grouped[m.key].append(m)
+    for key in grouped:
+        grouped[key].sort(key=lambda m: m.created_at, reverse=True)
     return dict(grouped)
 
 

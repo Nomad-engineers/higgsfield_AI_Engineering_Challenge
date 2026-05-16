@@ -1,4 +1,5 @@
 import logging
+from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -6,6 +7,8 @@ from src.repositories.memory_repo import MemoryRepo
 from src.services.llm_service import llm_service
 
 logger = logging.getLogger(__name__)
+
+TYPE_PRIORITY = {"fact": 0, "preference": 1, "event": 2, "opinion": 3}
 
 
 class ExtractionService:
@@ -33,6 +36,8 @@ class ExtractionService:
             logger.info("No memories extracted")
             return []
 
+        raw_memories = self._dedup_same_turn(raw_memories)
+
         stored = []
         to_embed = []
 
@@ -57,6 +62,43 @@ class ExtractionService:
             {"id": str(m.id), "type": m.type, "key": m.key, "value": m.value}
             for m in stored
         ]
+
+    def _dedup_same_turn(self, raw_memories: list[dict]) -> list[dict]:
+        """Merge same-key extractions from a single LLM call.
+
+        When the LLM extracts multiple memories with the same key from one
+        message (e.g. a location fact + a location opinion), we merge them
+        into one memory preferring fact over opinion, combining values.
+        """
+        grouped = defaultdict(list)
+        for mem in raw_memories:
+            grouped[mem["key"]].append(mem)
+
+        result = []
+        for key, group in grouped.items():
+            if len(group) == 1:
+                result.append(group[0])
+                continue
+
+            group.sort(key=lambda m: TYPE_PRIORITY.get(m["type"], 4))
+
+            best = group[0]
+            merged_value = best["value"]
+            for other in group[1:]:
+                if other["value"].lower() not in merged_value.lower():
+                    merged_value = f"{merged_value}; {other['value']}"
+
+            merged = {
+                **best,
+                "value": merged_value,
+                "confidence": max(m.get("confidence", 1.0) for m in group),
+            }
+            logger.info(
+                f"Same-turn dedup: merged {len(group)} memories for key '{key}'"
+            )
+            result.append(merged)
+
+        return result
 
     async def _resolve_memory(
         self,

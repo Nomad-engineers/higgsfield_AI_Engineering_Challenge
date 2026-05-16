@@ -15,8 +15,6 @@ async def get_user_memories(user_id: str, db: AsyncSession = Depends(get_db)):
 
     superseded_by_map: dict[str, str] = {}
     for m in memories:
-        if m.supersedes and not m.active:
-            pass
         if m.supersedes:
             superseded_by_map[str(m.supersedes)] = str(m.id)
 
