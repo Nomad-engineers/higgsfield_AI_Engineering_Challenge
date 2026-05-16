@@ -7,6 +7,8 @@ class SearchResult(BaseModel):
     session_id: str
     timestamp: str
     metadata: dict = {}
+    key: str | None = None
+    type: str | None = None
 
 
 class SearchRequest(BaseModel):

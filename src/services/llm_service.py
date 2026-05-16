@@ -82,22 +82,29 @@ class LLMService:
         )
         return [item["embedding"] for item in data["data"]]
 
-    async def rerank(self, query: str, memories: list[dict]) -> list[int]:
+    async def rerank(
+        self, query: str, memories: list[dict], sub_queries: list[str] | None = None
+    ) -> dict:
         from src.prompts.rerank import RERANK_SYSTEM_PROMPT, RERANK_SCHEMA
 
         if not memories:
-            return []
+            return {"ranked_indices": [], "groups": []}
 
         numbered = "\n".join(
             f'{i+1}. "{m["value"]}" [{m["type"]}, key={m["key"]}]'
             for i, m in enumerate(memories)
         )
 
-        user_content = (
-            f'Query: "{query}"\n\n'
-            f"Rank these memories by relevance to the query. "
-            f"Return ONLY the indices in order of relevance.\n\n{numbered}"
+        parts = [f'Query: "{query}"']
+        if sub_queries and len(sub_queries) > 1:
+            sq_text = "\n".join(f"  - {sq}" for sq in sub_queries)
+            parts.append(f"Sub-queries (decomposed from the query):\n{sq_text}")
+        parts.append(
+            "Rank these memories by relevance. Identify groups of memories that "
+            "jointly answer the full query if it is multi-hop.\n"
         )
+        parts.append(numbered)
+        user_content = "\n\n".join(parts)
 
         data = await self._post_with_retry(
             "/chat/completions",
@@ -120,10 +127,82 @@ class LLMService:
         )
         content = data["choices"][0]["message"]["content"]
         parsed = json.loads(content)
+
         indices = parsed.get("ranked_indices", [])
         if indices and min(indices) == 0:
-            return indices
-        return [idx - 1 for idx in indices]
+            parsed["ranked_indices"] = indices
+        else:
+            parsed["ranked_indices"] = [idx - 1 for idx in indices]
+
+        for g in parsed.get("groups", []):
+            g_indices = g.get("indices", [])
+            if g_indices and min(g_indices) == 0:
+                g["indices"] = g_indices
+            else:
+                g["indices"] = [idx - 1 for idx in g_indices]
+
+        return parsed
+
+    async def rewrite_query(self, query: str) -> dict:
+        from src.prompts.query_rewrite import QUERY_REWRITE_SYSTEM_PROMPT, QUERY_REWRITE_SCHEMA
+
+        data = await self._post_with_retry(
+            "/chat/completions",
+            {
+                "model": settings.OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": QUERY_REWRITE_SYSTEM_PROMPT},
+                    {"role": "user", "content": f'Query: "{query}"'},
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "query_rewrite",
+                        "strict": True,
+                        "schema": QUERY_REWRITE_SCHEMA,
+                    },
+                },
+                "temperature": 0.1,
+            },
+        )
+        content = data["choices"][0]["message"]["content"]
+        return json.loads(content)
+
+    async def check_cross_key_contradiction(
+        self, new_key: str, new_value: str, new_type: str,
+        old_key: str, old_value: str, old_type: str,
+    ) -> dict:
+        from src.prompts.cross_key_contradiction import (
+            CROSS_KEY_CONTRADICTION_SYSTEM_PROMPT,
+            CROSS_KEY_CONTRADICTION_SCHEMA,
+        )
+
+        user_content = (
+            f'New memory (key="{new_key}", type="{new_type}"): "{new_value}"\n'
+            f'Existing memory (key="{old_key}", type="{old_type}"): "{old_value}"'
+        )
+
+        data = await self._post_with_retry(
+            "/chat/completions",
+            {
+                "model": settings.OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": CROSS_KEY_CONTRADICTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "cross_key_contradiction",
+                        "strict": True,
+                        "schema": CROSS_KEY_CONTRADICTION_SCHEMA,
+                    },
+                },
+                "temperature": 0.1,
+            },
+        )
+        content = data["choices"][0]["message"]["content"]
+        return json.loads(content)
 
     async def check_contradiction(
         self, key: str, old_value: str, new_value: str

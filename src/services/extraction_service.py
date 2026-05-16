@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 
 TYPE_PRIORITY = {"fact": 0, "preference": 1, "event": 2, "opinion": 3}
 
+CROSS_KEY_SIMILARITY_THRESHOLD = 0.80
+CROSS_KEY_CHECK_TYPES = {"fact", "preference"}
+
 
 class ExtractionService:
     def __init__(self, session: AsyncSession):
@@ -58,6 +61,15 @@ class ExtractionService:
         if to_embed:
             await self._batch_embed(to_embed)
 
+        # Cross-key contradiction check — runs after embedding so pgvector
+        # similarity search works on the newly stored memories.
+        re_embed_needed = await self._cross_key_contradiction_check(
+            user_id, stored,
+        )
+
+        if re_embed_needed:
+            await self._batch_embed(re_embed_needed)
+
         return [
             {"id": str(m.id), "type": m.type, "key": m.key, "value": m.value}
             for m in stored
@@ -80,17 +92,10 @@ class ExtractionService:
                 result.append(group[0])
                 continue
 
-            group.sort(key=lambda m: TYPE_PRIORITY.get(m["type"], 4))
-
-            best = group[0]
-            merged_value = best["value"]
-            for other in group[1:]:
-                if other["value"].lower() not in merged_value.lower():
-                    merged_value = f"{merged_value}; {other['value']}"
+            group.sort(key=lambda m: (TYPE_PRIORITY.get(m["type"], 4), -len(m["value"])))
 
             merged = {
-                **best,
-                "value": merged_value,
+                **group[0],
                 "confidence": max(m.get("confidence", 1.0) for m in group),
             }
             logger.info(
@@ -187,6 +192,76 @@ class ExtractionService:
             f"'{best_match.value[:40]}' -> '{value[:40]}'"
         )
         return memory
+
+    async def _cross_key_contradiction_check(
+        self, user_id: str, new_memories: list,
+    ) -> list:
+        """Find and resolve contradictions between memories with different keys.
+
+        Uses pgvector similarity search instead of Python cosine, which is
+        both faster and avoids loading all active memories into memory.
+
+        Returns a list of memories that need re-embedding (value was mutated).
+        """
+        if not new_memories:
+            return []
+
+        candidates = [
+            m for m in new_memories
+            if m.type in CROSS_KEY_CHECK_TYPES and m.embedding
+        ]
+        if not candidates:
+            return []
+
+        re_embed_needed = []
+
+        for new_mem in candidates:
+            similar = await self.memory_repo.find_cross_key_similar(
+                user_id=user_id,
+                embedding=new_mem.embedding,
+                exclude_key=new_mem.key,
+                exclude_id=new_mem.id,
+                threshold=CROSS_KEY_SIMILARITY_THRESHOLD,
+                limit=5,
+            )
+
+            for old_mem, similarity in similar:
+                try:
+                    result = await llm_service.check_cross_key_contradiction(
+                        new_key=new_mem.key,
+                        new_value=new_mem.value,
+                        new_type=new_mem.type,
+                        old_key=old_mem.key,
+                        old_value=old_mem.value,
+                        old_type=old_mem.type,
+                    )
+                except Exception as e:
+                    logger.warning(f"Cross-key contradiction check failed: {e}")
+                    continue
+
+                action = result.get("action", "keep_both")
+                relationship = result.get("relationship", "independent")
+                logger.info(
+                    f"Cross-key check: {new_mem.key} vs {old_mem.key} "
+                    f"(sim={similarity:.3f}) -> {relationship}/{action} "
+                    f"({result.get('reason', '')[:60]})"
+                )
+
+                if action == "supersede_old":
+                    await self.memory_repo.deactivate_by_id(old_mem.id)
+                    logger.info(
+                        f"Cross-key supersede: deactivated {old_mem.key} "
+                        f"('{old_mem.value[:40]}') due to {new_mem.key}"
+                    )
+                elif action == "merge":
+                    await self.memory_repo.deactivate_by_id(old_mem.id)
+                    new_mem.value = f"{new_mem.value}; previously {old_mem.value}"
+                    re_embed_needed.append(new_mem)
+                    logger.info(
+                        f"Cross-key merge: {new_mem.key} absorbed {old_mem.key}"
+                    )
+
+        return re_embed_needed
 
     async def _batch_embed(self, memories: list):
         texts = [f"{m.key}: {m.value}" for m in memories]

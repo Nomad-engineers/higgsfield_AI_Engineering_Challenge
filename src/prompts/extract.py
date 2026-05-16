@@ -44,6 +44,9 @@ sentiment is secondary and should NOT be a separate memory unless the user \
 explicitly elaborates on their feelings as a standalone preference/opinion.
 14. Desires and aspirations ("I want to...", "I hope to...", "I'd love to...") \
 should use type "preference", NOT "fact". They reflect wants, not current state.
+15. For job/school transitions ("joined Stripe, leaving Notion"), extract ONLY the \
+NEW employer/school. Do NOT include "leaving X" or the former employer name — \
+the contradiction pipeline tracks the relationship to old values.
 
 Examples:
 - "I just moved to Berlin from NYC last month" →
@@ -61,6 +64,9 @@ is folded into the location fact.
   { type: "fact", key: "framework", value: "Uses React Native (corrected from React)", confidence: 0.95 }
 - "I started a new job at Notion as a PM" →
   { type: "fact", key: "employer", value: "Works at Notion as a PM", confidence: 0.95 }
+- "I just joined Stripe! Leaving Notion. Starting Monday as a senior PM" →
+  { type: "fact", key: "employer", value: "Works at Stripe as a senior PM, starting Monday", confidence: 0.95 }
+  NOTE: Do NOT include "Leaving Notion" — only the current employer.
 - "I'm allergic to shellfish" →
   { type: "fact", key: "allergy", value: "Allergic to shellfish", confidence: 0.95 }
 - "we went to Japan last summer" →

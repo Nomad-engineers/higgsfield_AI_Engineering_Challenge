@@ -154,16 +154,20 @@ class MemoryRepo:
     async def bm25_search(self, user_id: str, query: str,
                           limit: int = 20) -> list[tuple[Memory, float]]:
         stmt = text("""
-            SELECT id, user_id, type, key, value, confidence, source_session,
-                   source_turn_id, supersedes, active, created_at, updated_at,
-                   ts_rank_cd(
-                       search_vector,
-                       plainto_tsquery('english', :query)
-                   ) AS bm25_score
-            FROM memories
-            WHERE user_id = :user_id
-              AND active = TRUE
-              AND search_vector @@ plainto_tsquery('english', :query)
+            WITH tsq AS (
+                SELECT COALESCE(
+                    websearch_to_tsquery('english', :query),
+                    plainto_tsquery('english', :query)
+                ) AS q
+            )
+            SELECT m.id, m.user_id, m.type, m.key, m.value, m.confidence,
+                   m.source_session, m.source_turn_id, m.supersedes, m.active,
+                   m.created_at, m.updated_at,
+                   ts_rank_cd(m.search_vector, tsq.q) AS bm25_score
+            FROM memories m, tsq
+            WHERE m.user_id = :user_id
+              AND m.active = TRUE
+              AND m.search_vector @@ tsq.q
             ORDER BY bm25_score DESC
             LIMIT :limit
         """)
@@ -181,6 +185,52 @@ class MemoryRepo:
                 created_at=row.created_at, updated_at=row.updated_at,
             )
             memories.append((m, float(row.bm25_score)))
+        return memories
+
+    async def find_cross_key_similar(
+        self, user_id: str, embedding: list[float], exclude_key: str,
+        exclude_id: uuid.UUID | None = None,
+        threshold: float = 0.8, limit: int = 5,
+    ) -> list[tuple[Memory, float]]:
+        conditions = [
+            "user_id = :user_id",
+            "active = TRUE",
+            "embedding IS NOT NULL",
+            "key != :exclude_key",
+            "1 - (embedding <=> :embedding) >= :threshold",
+        ]
+        params = {
+            "user_id": user_id,
+            "embedding": str(embedding),
+            "exclude_key": exclude_key,
+            "threshold": threshold,
+            "limit": limit,
+        }
+        if exclude_id:
+            conditions.append("id != :exclude_id")
+            params["exclude_id"] = str(exclude_id)
+
+        stmt = text(f"""
+            SELECT id, user_id, type, key, value, confidence, source_session,
+                   source_turn_id, supersedes, active, created_at, updated_at,
+                   1 - (embedding <=> :embedding) AS similarity
+            FROM memories
+            WHERE {' AND '.join(conditions)}
+            ORDER BY embedding <=> :embedding
+            LIMIT :limit
+        """)
+        result = await self.session.execute(stmt, params)
+        rows = result.fetchall()
+        memories = []
+        for row in rows:
+            m = Memory(
+                id=row.id, user_id=row.user_id, type=row.type, key=row.key,
+                value=row.value, confidence=row.confidence,
+                source_session=row.source_session, source_turn_id=row.source_turn_id,
+                supersedes=row.supersedes, active=row.active,
+                created_at=row.created_at, updated_at=row.updated_at,
+            )
+            memories.append((m, float(row.similarity)))
         return memories
 
     async def get_stable_facts(self, user_id: str, min_confidence: float = 0.8) -> list[Memory]:

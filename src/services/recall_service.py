@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 RRF_K = 60
 RERANK_TOP_K = 15
 RECALL_RELEVANCE_THRESHOLD = 0.25
+RERANK_NOISE_FLOOR = 0.30
 
 
 def estimate_tokens(text: str) -> int:
@@ -161,24 +162,63 @@ class RecallService:
         if not user_id:
             return await self._session_recall(query, session_id, max_tokens)
 
+        # Query rewriting: decompose multi-hop queries into sub-queries
+        sub_queries = await self._rewrite_query(query)
+
+        # Embed all sub-queries in one batch
         try:
-            query_embeddings = await llm_service.embed([query])
-            query_embedding = query_embeddings[0]
+            all_embeddings = await llm_service.embed(sub_queries)
         except Exception as e:
             logger.warning(f"Query embedding failed, falling back to recent: {e}")
             return await self._fallback_recall(user_id, max_tokens)
 
-        vector_results, bm25_results = await self._hybrid_search(user_id, query, query_embedding)
+        # Run hybrid search for each sub-query and merge results
+        all_vector_results: list[tuple] = []
+        all_bm25_results: list[tuple] = []
+        similarity_map: dict[uuid.UUID, float] = {}
 
-        fused = rrf_merge(vector_results, bm25_results)
+        for sq, emb in zip(sub_queries, all_embeddings):
+            vec_res, bm25_res = await self._hybrid_search(user_id, sq, emb)
+            all_vector_results.extend(vec_res)
+            all_bm25_results.extend(bm25_res)
+            for m, sim in vec_res:
+                if m.id not in similarity_map or sim > similarity_map[m.id]:
+                    similarity_map[m.id] = sim
+
+        fused = rrf_merge(all_vector_results, all_bm25_results)
         if not fused:
             return await self._fallback_recall(user_id, max_tokens)
 
-        reranked = await self._rerank(query, fused)
+        reranked = await self._rerank(query, fused, sub_queries)
+
+        query_embedding = all_embeddings[0]
 
         return await self._assemble_context(
-            query, user_id, reranked, session_id, max_tokens, query_embedding
+            query, user_id, reranked, session_id, max_tokens,
+            query_embedding, similarity_map,
         )
+
+    async def _rewrite_query(self, query: str) -> list[str]:
+        if len(query.split()) <= 4:
+            return [query]
+
+        try:
+            result = await llm_service.rewrite_query(query)
+        except Exception as e:
+            logger.warning(f"Query rewrite failed, using original: {e}")
+            return [query]
+
+        if not result.get("is_multi_hop", False):
+            return [query]
+
+        sub_queries = result.get("sub_queries", [])
+        if not sub_queries or len(sub_queries) < 2:
+            return [query]
+
+        logger.info(
+            f"Query rewritten: '{query[:60]}' -> {len(sub_queries)} sub-queries"
+        )
+        return sub_queries
 
     async def _hybrid_search(
         self, user_id: str, query: str, query_embedding: list[float]
@@ -199,7 +239,9 @@ class RecallService:
 
         return vector_results, bm25_results
 
-    async def _rerank(self, query: str, fused: list[tuple]) -> list[tuple]:
+    async def _rerank(
+        self, query: str, fused: list[tuple], sub_queries: list[str] | None = None
+    ) -> list[tuple]:
         top_k = fused[:RERANK_TOP_K]
         if len(top_k) <= 1:
             return top_k
@@ -210,10 +252,13 @@ class RecallService:
         ]
 
         try:
-            ranked_indices = await llm_service.rerank(query, memories_for_rerank)
+            result = await llm_service.rerank(query, memories_for_rerank, sub_queries)
         except Exception as e:
             logger.warning(f"LLM rerank failed, using RRF order: {e}")
             return top_k
+
+        ranked_indices = result["ranked_indices"]
+        groups = result.get("groups", [])
 
         reranked = []
         for idx in ranked_indices:
@@ -225,7 +270,28 @@ class RecallService:
             if i not in seen:
                 reranked.append(item)
 
-        return reranked
+        if not groups:
+            return reranked
+
+        grouped_indices = set()
+        for g in groups:
+            for idx in g["indices"]:
+                if 0 <= idx < len(top_k):
+                    grouped_indices.add(idx)
+
+        if not grouped_indices:
+            return reranked
+
+        # Ensure all group members are present, then append any missing at the front
+        seen_ids = {id(top_k[i][0]) for i in seen if 0 <= i < len(top_k)}
+        group_items = []
+        for idx in sorted(grouped_indices):
+            if id(top_k[idx][0]) not in {id(it[0]) for it in group_items}:
+                group_items.append(top_k[idx])
+
+        non_group_items = [it for it in reranked if id(it[0]) not in {id(g[0]) for g in group_items}]
+
+        return group_items + non_group_items
 
     async def _assemble_context(
         self,
@@ -235,10 +301,30 @@ class RecallService:
         session_id: str | None,
         max_tokens: int,
         query_embedding: list[float] | None = None,
+        similarity_map: dict | None = None,
     ) -> tuple[str, list[dict]]:
         budget = max_tokens
         sections = []
         citations = []
+
+        # Gate query-relevant results by vector similarity
+        if similarity_map and reranked:
+            sims = {m.id: similarity_map.get(m.id, 0) for m, _ in reranked}
+            max_sim = max(sims.values())
+
+            if max_sim < RECALL_RELEVANCE_THRESHOLD:
+                reranked = []
+            elif max_sim < 0.50:
+                reranked = [
+                    (m, score) for m, score in reranked
+                    if sims[m.id] >= RERANK_NOISE_FLOOR
+                ]
+            else:
+                threshold = max(RERANK_NOISE_FLOOR, max_sim * 0.5)
+                reranked = [
+                    (m, score) for m, score in reranked
+                    if sims[m.id] >= threshold
+                ]
 
         # Phase 1: Stable facts (35% budget) — only if query-relevant
         facts_budget = int(budget * 0.35)
