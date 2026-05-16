@@ -63,20 +63,23 @@ Raw conversation turns are processed into structured memories via GPT-4o-mini wi
 4. **Contradiction check** — compare ONLY against the most recent existing memory for the same key. LLM classifies the relationship: `new`, `update`, `contradiction`, `correction`, or `nuance`. Prompt explicitly separates sentiment from fact ("loves living in Berlin" ≠ new location).
 5. **Supersession** — for update/contradict/correction/nuance: deactivate old memory, create new with `supersedes` chain. History preserved via linked list.
 6. **Batch embed** — all new memories embedded in one API call (`text-embedding-3-small`, 1536d)
+7. **Cross-key contradiction check** — after embedding, each new fact/preference is compared against ALL active memories with different keys. pgvector similarity search (cosine > 0.80) identifies semantically related memories; LLM classifies the relationship. If `employer="Joined Stripe"` conflicts with `title="Senior PM at Notion"`, the old title gets deactivated. Runs only for `fact` and `preference` types.
 
-Extraction handles: explicit facts, implicit facts ("walking Biscuit" → has a dog named Biscuit), corrections ("actually, I meant React Native"), mixed fact+sentiment statements ("moved to Berlin, loving it" → one location fact), and opinion evolution. Multi-message turns (including tool calls with `name` field) are handled — the extraction pipeline concatenates all messages and processes them as a single conversation segment.
+Extraction handles: explicit facts, implicit facts ("walking Biscuit" → has a dog named Biscuit), corrections ("actually, I meant React Native"), mixed fact+sentiment statements ("moved to Berlin, loving it" → one location fact), opinion evolution, and cross-key contradictions where semantically related facts have different key names. Multi-message turns (including tool calls with `name` field) are handled — the extraction pipeline concatenates all messages and processes them as a single conversation segment.
 
 If the OpenAI API is unavailable, the turn is still persisted and extraction fails gracefully with a warning log.
 
 ## Recall Strategy
 
-`POST /recall` runs a 5-stage pipeline:
+`POST /recall` runs a 7-stage pipeline:
 
-1. **Vector search** — pgvector HNSW cosine similarity, top-20 candidates
-2. **BM25 search** — pre-computed `tsvector` column with GIN index + `plainto_tsquery`, top-20 candidates
-3. **Reciprocal Rank Fusion** (k=60) — merge both result sets, deduplicate by memory ID
-4. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking
-5. **Context assembly** — format ranked memories into structured text under the token budget, with relevance gating
+1. **Query rewriting** — LLM decomposes multi-hop queries into 2-3 sub-queries. Simple queries pass through unchanged. Sub-query embeddings batched in one API call.
+2. **Vector search** — pgvector HNSW cosine similarity, top-20 candidates per sub-query
+3. **BM25 search** — pre-computed `tsvector` column with GIN index + `websearch_to_tsquery` (falls back to `plainto_tsquery`), top-20 candidates per sub-query
+4. **Reciprocal Rank Fusion** (k=60) — merge all sub-query result sets, deduplicate by memory ID
+5. **LLM reranking** — top-15 fused candidates sent to GPT-4o-mini for query-relevance ranking with multi-hop reasoning. Returns grouped memories that jointly answer the query.
+6. **Noise gating** — adaptive similarity thresholds filter irrelevant results: 0.35 floor, 0.50 breakpoint with stricter filtering below, relevance density check for stable facts
+7. **Context assembly** — format ranked memories into structured text under the token budget, with relevance gating and dynamic budget allocation
 
 ### Token Budget Priority
 
