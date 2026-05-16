@@ -3,6 +3,8 @@
 Extracts date ranges from natural language temporal expressions like
 "last month", "recently", "3 years ago", "since January".
 """
+from __future__ import annotations
+
 import re
 from datetime import datetime, timedelta, timezone
 

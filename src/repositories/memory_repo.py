@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 
 import sqlalchemy
@@ -5,6 +7,24 @@ from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.memory import Memory
+
+_MEMORY_COLUMNS = (
+    "id", "user_id", "type", "key", "value", "confidence", "source_session",
+    "source_turn_id", "supersedes", "active", "created_at", "updated_at",
+    "extraction_method", "turn_index", "provenance",
+)
+
+
+def _row_to_memory(row) -> Memory:
+    return Memory(
+        id=row.id, user_id=row.user_id, type=row.type, key=row.key,
+        value=row.value, confidence=row.confidence,
+        source_session=row.source_session, source_turn_id=row.source_turn_id,
+        supersedes=row.supersedes, active=row.active,
+        created_at=row.created_at, updated_at=row.updated_at,
+        embedding=None, extraction_method=row.extraction_method,
+        turn_index=row.turn_index, provenance=row.provenance,
+    )
 
 
 class MemoryRepo:
@@ -98,41 +118,21 @@ class MemoryRepo:
         return list(result.scalars().all())
 
     async def key_search(self, user_id: str, keys: list[str],
-                        limit: int = 20) -> list[tuple[Memory, float]]:
-        """Direct SQL match on memory key column - deterministic recall boost."""
+                         limit: int = 20) -> list[tuple[Memory, float]]:
         if not keys:
             return []
-        placeholders = ", ".join(f":k{i}" for i in range(len(keys)))
-        params = {f"k{i}": k for i, k in enumerate(keys)}
-        params["user_id"] = user_id
-        params["limit"] = limit
-
-        stmt = text(f"""
-            SELECT id, user_id, type, key, value, confidence, source_session,
-                   source_turn_id, supersedes, active, created_at, updated_at,
-                   extraction_method, turn_index, provenance
-            FROM memories
-            WHERE user_id = :user_id
-              AND active = TRUE
-              AND key IN ({placeholders})
-            ORDER BY created_at DESC
-            LIMIT :limit
-        """)
-        result = await self.session.execute(stmt, params)
-        rows = result.fetchall()
-        memories = []
-        for row in rows:
-            m = Memory(
-                id=row.id, user_id=row.user_id, type=row.type, key=row.key,
-                value=row.value, confidence=row.confidence,
-                source_session=row.source_session, source_turn_id=row.source_turn_id,
-                supersedes=row.supersedes, active=row.active,
-                created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None, extraction_method=row.extraction_method,
-                turn_index=row.turn_index, provenance=row.provenance,
+        result = await self.session.execute(
+            select(Memory)
+            .where(
+                Memory.user_id == user_id,
+                Memory.active == True,
+                Memory.key.in_(keys),
             )
-            memories.append((m, m.confidence))
-        return memories
+            .order_by(Memory.created_at.desc())
+            .limit(limit)
+        )
+        memories = list(result.scalars().all())
+        return [(m, m.confidence) for m in memories]
 
     async def get_recent_by_user(self, user_id: str, limit: int = 10) -> list[Memory]:
         result = await self.session.execute(
@@ -167,50 +167,34 @@ class MemoryRepo:
 
     async def vector_search(self, user_id: str, query_embedding: list[float],
                             limit: int = 20) -> list[tuple[Memory, float]]:
-        stmt = text("""
-            SELECT id, user_id, type, key, value, confidence, source_session,
-                   source_turn_id, supersedes, active, created_at, updated_at,
-                   extraction_method, turn_index, provenance,
+        cols = ", ".join(f"m.{c}" for c in _MEMORY_COLUMNS)
+        stmt = text(f"""
+            SELECT {cols},
                    1 - (embedding <=> :embedding) AS similarity
-            FROM memories
-            WHERE user_id = :user_id
-              AND active = TRUE
-              AND embedding IS NOT NULL
-            ORDER BY embedding <=> :embedding
+            FROM memories m
+            WHERE m.user_id = :user_id
+              AND m.active = TRUE
+              AND m.embedding IS NOT NULL
+            ORDER BY m.embedding <=> :embedding
             LIMIT :limit
         """)
         result = await self.session.execute(
             stmt,
             {"user_id": user_id, "embedding": str(query_embedding), "limit": limit},
         )
-        rows = result.fetchall()
-        memories = []
-        for row in rows:
-            m = Memory(
-                id=row.id, user_id=row.user_id, type=row.type, key=row.key,
-                value=row.value, confidence=row.confidence,
-                source_session=row.source_session, source_turn_id=row.source_turn_id,
-                supersedes=row.supersedes, active=row.active,
-                created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None, extraction_method=row.extraction_method,
-                turn_index=row.turn_index, provenance=row.provenance,
-            )
-            memories.append((m, float(row.similarity)))
-        return memories
+        return [(_row_to_memory(row), float(row.similarity)) for row in result.fetchall()]
 
     async def bm25_search(self, user_id: str, query: str,
                           limit: int = 20) -> list[tuple[Memory, float]]:
-        stmt = text("""
+        cols = ", ".join(f"m.{c}" for c in _MEMORY_COLUMNS)
+        stmt = text(f"""
             WITH tsq AS (
                 SELECT COALESCE(
                     websearch_to_tsquery('english', :query),
                     plainto_tsquery('english', :query)
                 ) AS q
             )
-            SELECT m.id, m.user_id, m.type, m.key, m.value, m.confidence,
-                   m.source_session, m.source_turn_id, m.supersedes, m.active,
-                   m.created_at, m.updated_at,
-                   m.extraction_method, m.turn_index, m.provenance,
+            SELECT {cols},
                    ts_rank_cd(m.search_vector, tsq.q) AS bm25_score
             FROM memories m, tsq
             WHERE m.user_id = :user_id
@@ -222,20 +206,7 @@ class MemoryRepo:
         result = await self.session.execute(
             stmt, {"user_id": user_id, "query": query, "limit": limit},
         )
-        rows = result.fetchall()
-        memories = []
-        for row in rows:
-            m = Memory(
-                id=row.id, user_id=row.user_id, type=row.type, key=row.key,
-                value=row.value, confidence=row.confidence,
-                source_session=row.source_session, source_turn_id=row.source_turn_id,
-                supersedes=row.supersedes, active=row.active,
-                created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None, extraction_method=row.extraction_method,
-                turn_index=row.turn_index, provenance=row.provenance,
-            )
-            memories.append((m, float(row.bm25_score)))
-        return memories
+        return [(_row_to_memory(row), float(row.bm25_score)) for row in result.fetchall()]
 
     async def find_cross_key_similar(
         self, user_id: str, embedding: list[float], exclude_key: str,
@@ -243,11 +214,11 @@ class MemoryRepo:
         threshold: float = 0.8, limit: int = 5,
     ) -> list[tuple[Memory, float]]:
         conditions = [
-            "user_id = :user_id",
-            "active = TRUE",
-            "embedding IS NOT NULL",
-            "key != :exclude_key",
-            "1 - (embedding <=> :embedding) >= :threshold",
+            "m.user_id = :user_id",
+            "m.active = TRUE",
+            "m.embedding IS NOT NULL",
+            "m.key != :exclude_key",
+            "1 - (m.embedding <=> :embedding) >= :threshold",
         ]
         params = {
             "user_id": user_id,
@@ -257,34 +228,20 @@ class MemoryRepo:
             "limit": limit,
         }
         if exclude_id:
-            conditions.append("id != :exclude_id")
+            conditions.append("m.id != :exclude_id")
             params["exclude_id"] = str(exclude_id)
 
+        cols = ", ".join(f"m.{c}" for c in _MEMORY_COLUMNS)
         stmt = text(f"""
-            SELECT id, user_id, type, key, value, confidence, source_session,
-                   source_turn_id, supersedes, active, created_at, updated_at,
-                   extraction_method, turn_index, provenance,
-                   1 - (embedding <=> :embedding) AS similarity
-            FROM memories
+            SELECT {cols},
+                   1 - (m.embedding <=> :embedding) AS similarity
+            FROM memories m
             WHERE {' AND '.join(conditions)}
-            ORDER BY embedding <=> :embedding
+            ORDER BY m.embedding <=> :embedding
             LIMIT :limit
         """)
         result = await self.session.execute(stmt, params)
-        rows = result.fetchall()
-        memories = []
-        for row in rows:
-            m = Memory(
-                id=row.id, user_id=row.user_id, type=row.type, key=row.key,
-                value=row.value, confidence=row.confidence,
-                source_session=row.source_session, source_turn_id=row.source_turn_id,
-                supersedes=row.supersedes, active=row.active,
-                created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None, extraction_method=row.extraction_method,
-                turn_index=row.turn_index, provenance=row.provenance,
-            )
-            memories.append((m, float(row.similarity)))
-        return memories
+        return [(_row_to_memory(row), float(row.similarity)) for row in result.fetchall()]
 
     async def get_stable_facts(self, user_id: str, min_confidence: float = 0.8) -> list[Memory]:
         result = await self.session.execute(
@@ -302,17 +259,15 @@ class MemoryRepo:
         self, user_id: str, query_embedding: list[float],
         min_confidence: float = 0.8, min_similarity: float = 0.35,
     ) -> list[Memory]:
-        stmt = text("""
-            SELECT id, user_id, type, key, value, confidence, source_session,
-                   source_turn_id, supersedes, active, created_at, updated_at,
-                   extraction_method, turn_index, provenance
-            FROM memories
-            WHERE user_id = :user_id
-              AND active = TRUE
-              AND confidence >= :min_confidence
-              AND embedding IS NOT NULL
-              AND 1 - (embedding <=> :embedding) >= :min_similarity
-            ORDER BY (1 - (embedding <=> :embedding)) DESC
+        stmt = text(f"""
+            SELECT m.{', m.'.join(_MEMORY_COLUMNS)}
+            FROM memories m
+            WHERE m.user_id = :user_id
+              AND m.active = TRUE
+              AND m.confidence >= :min_confidence
+              AND m.embedding IS NOT NULL
+              AND 1 - (m.embedding <=> :embedding) >= :min_similarity
+            ORDER BY (1 - (m.embedding <=> :embedding)) DESC
         """)
         result = await self.session.execute(
             stmt,
@@ -323,17 +278,4 @@ class MemoryRepo:
                 "min_similarity": min_similarity,
             },
         )
-        rows = result.fetchall()
-        memories = []
-        for row in rows:
-            m = Memory(
-                id=row.id, user_id=row.user_id, type=row.type, key=row.key,
-                value=row.value, confidence=row.confidence,
-                source_session=row.source_session, source_turn_id=row.source_turn_id,
-                supersedes=row.supersedes, active=row.active,
-                created_at=row.created_at, updated_at=row.updated_at,
-                embedding=None, extraction_method=row.extraction_method,
-                turn_index=row.turn_index, provenance=row.provenance,
-            )
-            memories.append(m)
-        return memories
+        return [_row_to_memory(row) for row in result.fetchall()]

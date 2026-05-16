@@ -8,3 +8,4 @@ build/
 pgdata/
 .venv/
 .claude/
+plan.md

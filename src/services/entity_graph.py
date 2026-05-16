@@ -3,6 +3,8 @@
 Builds an adjacency graph from co-occurring keys within the same session/turn,
 supplemented by a seed from static KEY_RELATIONS for cold-start coverage.
 """
+from __future__ import annotations
+
 from collections import defaultdict
 from dataclasses import dataclass, field
 

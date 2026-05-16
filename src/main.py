@@ -28,10 +28,16 @@ async def _init_schema():
             text("CREATE EXTENSION IF NOT EXISTS vector")
         )
         await conn.run_sync(_create_tables)
-        # Add search_vector column + GIN index if not yet present (existing DBs)
-        await conn.execute(text(
-            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS search_vector tsvector"
-        ))
+        # Migrations for existing DBs
+        for col, col_type in [
+            ("search_vector", "tsvector"),
+            ("extraction_method", "VARCHAR(10)"),
+            ("turn_index", "INTEGER"),
+            ("provenance", "VARCHAR"),
+        ]:
+            await conn.execute(text(
+                f"ALTER TABLE memories ADD COLUMN IF NOT EXISTS {col} {col_type}"
+            ))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_memories_search ON memories USING gin (search_vector)"
         ))
