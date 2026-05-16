@@ -1,6 +1,22 @@
 # Memory Service for AI Agents
 
-A Dockerized memory service that ingests conversation turns, extracts structured knowledge via LLM + rule-based fallback, and answers recall queries with hybrid vector/BM25 retrieval.
+A production-grade memory service that ingests conversation turns, extracts structured knowledge via LLM + rule-based extraction, and answers recall queries with hybrid vector/BM25 retrieval. Built for the Higgsfield AI Engineering Challenge.
+
+**205 tests** across contract, robustness, recall quality, hermetic, extraction, and persistence categories. Fully functional with or without an OpenAI API key.
+
+## Quick Start
+
+```bash
+git clone <repo> memory-service && cd memory-service
+cp .env.example .env
+# Add your OPENAI_API_KEY to .env (optional — works without it)
+
+docker compose up -d
+# Wait for health
+until curl -sf http://localhost:8080/health; do sleep 1; done
+```
+
+The service exposes 7 endpoints: `/health`, `/turns`, `/recall`, `/search`, `/users/{id}/memories`, `/sessions/{id}`, `/users/{id}`.
 
 ## Architecture
 
@@ -80,7 +96,7 @@ All Pydantic schemas use `extra="forbid"` — unknown fields in request bodies a
 
 ## Recall Strategy
 
-`POST /recall` runs a 11-stage pipeline (with BM25-only fallback when no API key):
+`POST /recall` runs an 11-stage pipeline (with BM25-only fallback when no API key):
 
 1. **Query rewriting** — LLM decomposes multi-hop queries into 2-3 sub-queries. Simple queries pass through unchanged. Sub-query embeddings batched in one API call. (Skipped without API key.)
 2. **Temporal parsing** — extracts date ranges from temporal expressions ("last month", "3 days ago", "recently", "since January"). Returns `after`/`before` constraints and a boost factor.
@@ -120,21 +136,11 @@ For queries like "What city does the user with the dog named Biscuit live in?", 
 
 1. **Query rewriting** — the LLM decomposes the query into ["person has a dog named Biscuit", "where that person lives"]. Each sub-query gets its own embedding + hybrid search.
 2. **Multi-hop reranking** — the reranker prompt explicitly asks which memories, *when combined*, answer the query. It returns `groups` of memories that jointly contribute, with reasoning. Grouped memories are promoted to the top of results.
-3. **Entity expansion** — after initial retrieval, all discovered memory keys are looked up in a static relationship map (`KEY_RELATIONS`). Related keys are fetched deterministically via `key_search()`. For example, a query about "the user with the golden retriever" surfaces `pet`-keyed memories; entity expansion then also fetches `location`, `name`, `spouse`, and `child` memories, ensuring the location fact is in the candidate pool before reranking.
-
-| Source key | Related keys |
-|------------|-------------|
-| `pet` | location, name, spouse, child |
-| `employer` | occupation, title, location, education |
-| `spouse` | spouse_occupation, location, child |
-| `location` | employer, pet, name, hobby |
-| `education` | employer, occupation |
-| `programming_language` | framework, employer |
-| + 12 more keys | ... |
-
-Entity expansion only fires for multi-hop queries (when `len(sub_queries) > 1`), avoiding unnecessary work on simple single-hop queries.
+3. **Entity expansion** — after initial retrieval, all discovered memory keys are looked up in a dynamic entity graph built from co-occurring keys within the same session, seeded with static relationships for cold start. Related keys are fetched deterministically via `key_search()`.
 
 Entity expansion complements query decomposition by following dynamic key relationships from the entity graph. The graph builds adjacency from co-occurring keys within the same session, seeded with static relationships for cold start coverage. When a multi-hop query surfaces memories with key `pet`, the system automatically fetches related keys (e.g., `location`, `name`) to ensure all facts needed to answer a multi-hop query are in the candidate set before reranking.
+
+Entity expansion only fires for multi-hop queries (when `len(sub_queries) > 1`), avoiding unnecessary work on simple single-hop queries.
 
 ### Session-only Recall
 
@@ -205,66 +211,57 @@ This is a deliberate tradeoff: showing all opinions in recall context would cons
 | Delete turn with memories | Memory's `source_turn_id` set to NULL via ForeignKey SET NULL |
 | Slow disk | Recall still works from cached HNSW indexes, slight latency increase |
 | LLM rate limit | Retry up to 3 times with capped exponential backoff (max 10s wait) |
-| Reranker returns 0-based indices | Validated `0 <= idx < len(memories)`, out-of-range filtered |
-
-## How to Run
-
-```bash
-# Clone and configure
-git clone <repo> memory-service && cd memory-service
-cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
-
-# Start
-docker compose up -d
-
-# Wait for health
-until curl -sf http://localhost:8080/health; do sleep 1; done
-```
+| Reranker returns out-of-range indices | Validated `0 <= idx < len(memories)`, out-of-range filtered |
 
 ## How to Run Tests
 
-Contract, robustness, recall quality, and extraction tests run inside the Docker container:
+**205 tests** across 6 categories:
+
+| Category | Count | What it tests |
+|----------|-------|--------------|
+| Contract | 36 | Endpoint shapes, status codes, response structure |
+| Robustness | 31 | Malformed input, unicode, concurrent sessions, SQL injection |
+| Recall quality | 8 | 5 conversations, 12 probe queries, fact evolution |
+| Extraction E2E | 3 | Full pipeline: post turn → extraction → memories |
+| Hermetic | 83 | Query vocab, RRF merge, temporal parsing, entity graph, tiktoken, reranker |
+| Rule extractor | 42 | Regex patterns, key normalization, correction inference |
+| Persistence | 2 | Data survives `docker compose down` → `up` |
+
+### Container-based tests (require Docker stack)
 
 ```bash
-# Contract tests (endpoint shapes, status codes)
-docker compose exec app python -m pytest tests/contract/ -v
-
-# Recall quality (5 conversations, 12 probe queries)
-docker compose exec app python -m pytest tests/recall_quality/ -v -s
-
-# Robustness (malformed input, unicode, concurrent sessions)
-docker compose exec app python -m pytest tests/robustness/ -v
-
-# Extraction E2E (full pipeline: post turn -> extraction -> memories)
-docker compose exec app python -m pytest tests/test_extraction_e2e.py -v
+docker compose up -d
 
 # All container-based tests
 docker compose exec app python -m pytest tests/contract/ tests/robustness/ tests/recall_quality/ tests/test_extraction_e2e.py -v
+
+# Individual suites
+docker compose exec app python -m pytest tests/contract/ -v
+docker compose exec app python -m pytest tests/robustness/ -v
+docker compose exec app python -m pytest tests/recall_quality/ -v -s
+docker compose exec app python -m pytest tests/test_extraction_e2e.py -v
 ```
 
-Hermetic tests (no Docker, no API key, no database — pure unit tests):
+### Hermetic tests (no Docker, no API key, no database)
 
 ```bash
-# Query vocabulary and RRF merge logic
-python -m pytest tests/hermetic/ -v
+python -m pytest tests/hermetic/ tests/test_rule_extractor.py -v
 ```
 
-End-to-end smoke test (requires running Docker stack):
+### Persistence test (runs from host — restarts Docker stack)
+
+```bash
+pip install pytest httpx
+pytest tests/persistence/ -v
+```
+
+### End-to-end smoke test
 
 ```bash
 bash test_comprehensive.sh
 ```
 
-The persistence test must run from the **host** (it restarts the Docker stack, so it can't run inside the container):
-
-```bash
-# Requires pytest + httpx on the host
-pip install pytest httpx
-pytest tests/persistence/ -v
-```
-
-## Required API Keys
+## Configuration
 
 Set in `.env`:
 

@@ -26,6 +26,7 @@ RRF_K = 60
 TEMPORAL_ALPHA = 0.1
 RERANK_TOP_K = 15
 RECALL_RELEVANCE_THRESHOLD = 0.25
+MEDIUM_CONFIDENCE_THRESHOLD = 0.35
 RERANK_NOISE_FLOOR = 0.20
 STABLE_FACTS_MIN_DENSITY = 0.15
 KEY_MATCH_BOOST = 2.0
@@ -453,7 +454,10 @@ class RecallService:
         citations = []
 
         # Gate query-relevant results by vector similarity
-        # Authority signals: key_ids (direct key match) > vector sim > bm25_ids
+        # Three-tier gate:
+        #   >= MEDIUM_CONFIDENCE_THRESHOLD: all results pass noise floor
+        #   RECALL_RELEVANCE_THRESHOLD..MEDIUM: require key match
+        #   < RECALL_RELEVANCE_THRESHOLD: strict — key only
         has_authoritative = key_ids and any(m.id in key_ids for m, _ in reranked)
         max_sim = 0.0
         if similarity_map and reranked:
@@ -470,6 +474,16 @@ class RecallService:
                     reranked = [
                         (m, score) for m, score in reranked
                         if m.id in bm25_ids
+                    ]
+                else:
+                    reranked = []
+            elif max_sim < MEDIUM_CONFIDENCE_THRESHOLD:
+                # Marginal similarity — require key match or strong BM25 confirmation
+                if key_ids:
+                    reranked = [
+                        (m, score) for m, score in reranked
+                        if m.id in key_ids
+                        or sims[m.id] >= MEDIUM_CONFIDENCE_THRESHOLD
                     ]
                 else:
                     reranked = []
@@ -494,7 +508,7 @@ class RecallService:
             best_sim = max(similarity_map.get(m.id, 0) for m, _ in reranked) if reranked else 0
             has_key_match = key_ids and any(m.id in key_ids for m, _ in reranked)
             has_bm25 = bm25_ids and any(m.id in bm25_ids for m, _ in reranked)
-            if best_sim < RECALL_RELEVANCE_THRESHOLD and not has_key_match and not has_bm25:
+            if best_sim < MEDIUM_CONFIDENCE_THRESHOLD and not has_key_match and not has_bm25:
                 stable_facts = []
                 skip_stable = True
             else:

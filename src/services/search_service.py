@@ -43,8 +43,11 @@ class SearchService:
             logger.warning(f"Query embedding failed for search, falling back to BM25: {e}")
             return await self._fallback_search(query, user_id, limit)
 
+        expanded_query = expand_query_for_bm25(query)
+        hints = analyze_query(query)
+
         vector_coro = self.memory_repo.vector_search(user_id, query_embedding, limit=20)
-        bm25_coro = self.memory_repo.bm25_search(user_id, query, limit=20)
+        bm25_coro = self.memory_repo.bm25_search(user_id, expanded_query, limit=20)
 
         vector_results, bm25_results = await asyncio.gather(
             vector_coro, bm25_coro, return_exceptions=True
@@ -57,7 +60,13 @@ class SearchService:
             logger.warning(f"BM25 search failed: {bm25_results}")
             bm25_results = []
 
-        fused = rrf_merge(vector_results, bm25_results)
+        key_results = []
+        if hints["hint_keys"]:
+            key_results = await self.memory_repo.key_search(
+                user_id, list(hints["hint_keys"]), limit=10
+            )
+
+        fused = rrf_merge(vector_results, bm25_results, key_results)
 
         reranked = await self._rerank(query, fused)
 
