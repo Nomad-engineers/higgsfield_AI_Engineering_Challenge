@@ -479,7 +479,7 @@ memory-service/
 ├── pyproject.toml
 ├── alembic.ini                      # (removed — using inline schema)
 │
-├── app/
+├── src/
 │   ├── __init__.py
 │   ├── main.py                      # FastAPI app factory, lifespan, schema init
 │   ├── config.py                    # Pydantic Settings (env vars)
@@ -723,8 +723,8 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY pyproject.toml .
 RUN pip install --no-cache-dir .
-COPY app/ app/
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+COPY src/ src/
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
 ```
 
 ---
