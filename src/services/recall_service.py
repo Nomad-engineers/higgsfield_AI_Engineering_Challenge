@@ -310,12 +310,14 @@ class RecallService:
         query_embedding = all_embeddings[0]
 
         key_ids = {m.id for m, _ in key_results} if key_results else None
+        has_hints = bool(hints["hint_keys"])
 
         return await self._assemble_context(
             query, user_id, reranked, session_id, max_tokens,
             query_embedding, similarity_map,
             bm25_ids={m.id for m, _ in all_bm25_results},
             key_ids=key_ids,
+            has_hints=has_hints,
         )
 
     async def _rewrite_query(self, query: str) -> list[str]:
@@ -450,6 +452,7 @@ class RecallService:
         similarity_map: dict | None = None,
         bm25_ids: set | None = None,
         key_ids: set | None = None,
+        has_hints: bool = False,
     ) -> tuple[str, list[dict]]:
         budget = max_tokens
         sections = []
@@ -480,13 +483,25 @@ class RecallService:
                 else:
                     reranked = []
             elif max_sim < MEDIUM_CONFIDENCE_THRESHOLD:
-                # Marginal similarity — require key match, BM25, or passing base threshold
-                reranked = [
-                    (m, score) for m, score in reranked
-                    if sims[m.id] >= RECALL_RELEVANCE_THRESHOLD
-                    or (key_ids and m.id in key_ids)
-                    or (bm25_ids and m.id in bm25_ids)
-                ]
+                # Marginal similarity — allow through only with supporting evidence
+                has_key_hit = key_ids and any(m.id in key_ids for m, _ in reranked)
+                has_bm25_hit = bm25_ids and any(m.id in bm25_ids for m, _ in reranked)
+                if has_key_hit or has_bm25_hit:
+                    reranked = [
+                        (m, score) for m, score in reranked
+                        if (key_ids and m.id in key_ids)
+                        or (bm25_ids and m.id in bm25_ids)
+                        or sims[m.id] >= MEDIUM_CONFIDENCE_THRESHOLD
+                    ]
+                elif has_hints:
+                    # Query had hints but nothing matched — strict filter
+                    reranked = []
+                else:
+                    # No hints at all — allow marginal vector results through
+                    reranked = [
+                        (m, score) for m, score in reranked
+                        if sims[m.id] >= RECALL_RELEVANCE_THRESHOLD
+                    ]
             else:
                 reranked = [
                     (m, score) for m, score in reranked
@@ -509,7 +524,7 @@ class RecallService:
             best_sim = max(similarity_map.get(m.id, 0) for m, _ in reranked) if reranked else 0
             has_key_match = key_ids and any(m.id in key_ids for m, _ in reranked)
             has_bm25 = bm25_ids and any(m.id in bm25_ids for m, _ in reranked)
-            if best_sim < RECALL_RELEVANCE_THRESHOLD and not has_key_match and not has_bm25:
+            if best_sim < RECALL_RELEVANCE_THRESHOLD and not has_key_match and not has_bm25 and has_hints:
                 stable_facts = []
                 skip_stable = True
             else:
